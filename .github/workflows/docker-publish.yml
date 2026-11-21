@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -22,12 +22,24 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies & run tests
+      - name: Install dependencies, run tests & build DSM 7 SPK
         run: |
           pip install -e ".[dev]"
           ruff check src tests
           pytest -v
           python synology-spk/build_spk.py
+
+      - name: Upload DSM 7 SPK to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view v1.0.0 >/dev/null 2>&1; then
+            gh release upload v1.0.0 dist/gphotos-migrator-dsm7.spk --clobber
+          else
+            gh release create v1.0.0 dist/gphotos-migrator-dsm7.spk \
+              --title "v1.0.0 — Native Synology DSM 7 App + Docker Engine" \
+              --notes "Install gphotos-migrator-dsm7.spk in Synology DSM Package Center -> Manual Install."
+          fi
 
   publish:
     needs: test
