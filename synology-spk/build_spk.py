@@ -24,7 +24,7 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
 DIST_DIR = PROJECT_ROOT / "dist"
-VERSION = "1.1.0-0001"
+VERSION = "1.1.0-0002"
 PKG_NAME = "gphotos-migrator"
 
 DSM_ARCH_MAP: dict[str, str] = {
@@ -285,9 +285,9 @@ def build_spk(
             'displayname="Google Photos Migrator"',
             f'description="{desc}"',
             f'arch="{DSM_ARCH_MAP[arch_key]}"',
-            'maintainer="0denko"',
+            'maintainer="Oleksandr Danylchenko"',
             'maintainer_url="https://github.com/0denko/gphotos-to-synology"',
-            'distributor="0denko"',
+            'distributor="Oleksandr Danylchenko"',
             'os_min_ver="7.0-40000"',
             'thirdparty="yes"',
             'startable="yes"',

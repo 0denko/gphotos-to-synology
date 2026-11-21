@@ -8,6 +8,7 @@ version = "1.0.0"
 description = "Unattended background migration of Google Photos Takeout archives to Synology DSM / Synology Photos"
 readme = "README.md"
 requires-python = ">=3.11"
+authors = [{ name = "Oleksandr Danylchenko" }]
 license = { text = "MIT" }
 dependencies = [
     "fastapi>=0.115.0,<1.0.0",
