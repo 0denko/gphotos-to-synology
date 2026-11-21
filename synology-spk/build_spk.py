@@ -24,7 +24,7 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
 DIST_DIR = PROJECT_ROOT / "dist"
-VERSION = "1.1.0-0002"
+VERSION = "1.1.0-0003"
 PKG_NAME = "gphotos-migrator"
 
 DSM_ARCH_MAP: dict[str, str] = {
@@ -226,7 +226,8 @@ def build_spk(
     payload = stage / "payload"
     ui_dst = payload / "ui"
     shutil.copytree(ROOT / "ui", ui_dst)
-    (ui_dst / "proxy.cgi").chmod(0o755)
+    for cgi_file in ui_dst.glob("*.cgi"):
+        cgi_file.chmod(0o755)
 
     # Embed standalone PyInstaller --onedir bundle when building native self-contained SPK
     if bundle_dir is not None:

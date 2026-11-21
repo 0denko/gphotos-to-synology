@@ -1,11 +1,24 @@
 (() => {
   const $ = (id) => document.getElementById(id);
 
-  // Supports both root (http://nas:8765/) and Synology DSM proxy (/webman/3rdparty/gphotos-migrator/proxy.cgi/)
+  // Supports direct mode (http://nas:8765/) and Synology DSM 7 CGI mode
+  // (/webman/3rdparty/gphotos-migrator/proxy.cgi?p=/api/...)
+  const IS_CGI_PROXY = window.location.pathname.endsWith(".cgi");
   const BASE_PATH = window.location.pathname.endsWith("/")
     ? window.location.pathname
     : `${window.location.pathname}/`;
-  const urlFor = (relPath) => `${BASE_PATH}${relPath.replace(/^\/+/, "")}`;
+
+  const urlFor = (relPath) => {
+    const clean = relPath.replace(/^\/+/, "");
+    if (!IS_CGI_PROXY) {
+      return `${BASE_PATH}${clean}`;
+    }
+    const qIdx = clean.indexOf("?");
+    const subPath = "/" + (qIdx >= 0 ? clean.slice(0, qIdx) : clean);
+    const extraQs = qIdx >= 0 ? clean.slice(qIdx + 1) : "";
+    const base = `${window.location.pathname}?p=${encodeURIComponent(subPath)}`;
+    return extraQs ? `${base}&${extraQs}` : base;
+  };
 
   let activeProfileId = "default";
   let profilesCache = [];
@@ -292,7 +305,10 @@
   }
 
   async function loadSettings() {
-    $("computed-redirect-uri").textContent = `${window.location.origin}${urlFor("api/oauth/google/callback")}`;
+    const defaultRedirectUri = IS_CGI_PROXY
+      ? `${window.location.origin}${window.location.pathname.replace(/[^/]+$/, "oauth_callback.cgi")}`
+      : `${window.location.origin}${urlFor("api/oauth/google/callback")}`;
+    $("computed-redirect-uri").textContent = defaultRedirectUri;
     try {
       const { settings } = await apiFetch("/api/settings");
       const form = $("settings-form");

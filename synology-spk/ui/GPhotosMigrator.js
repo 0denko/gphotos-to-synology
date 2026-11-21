@@ -20,7 +20,7 @@ Ext.define("SYNO.SDS.GPhotosMigrator.Application", {
 Ext.define("SYNO.SDS.GPhotosMigrator.AppWindow", {
     extend: "SYNO.SDS.AppWindow",
 
-    PROXY_URL: "/webman/3rdparty/gphotos-migrator/proxy.cgi/",
+    PROXY_URL: "/webman/3rdparty/gphotos-migrator/proxy.cgi",
 
     constructor: function (cfg) {
         cfg = cfg || {};

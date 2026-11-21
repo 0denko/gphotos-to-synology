@@ -358,6 +358,8 @@ def create_api_router() -> APIRouter:
         settings = pctx.config_manager.settings
         if settings.google_redirect_uri.strip():
             return settings.google_redirect_uri.strip()
+        if request.headers.get("x-proxy-mode") == "cgi":
+            return f"{_public_base_url(request)}/oauth_callback.cgi"
         return f"{_public_base_url(request)}/api/oauth/google/callback"
 
     @router.get("/oauth/google/start")
@@ -383,7 +385,10 @@ def create_api_router() -> APIRouter:
     ) -> RedirectResponse:
         app_ctx = _app_ctx(request)
         base_prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")
-        home_url = f"{base_prefix}/"
+        if request.headers.get("x-proxy-mode") == "cgi":
+            home_url = f"{base_prefix}/proxy.cgi"
+        else:
+            home_url = f"{base_prefix}/"
 
         profile_id = "default"
         if state and ":" in state:

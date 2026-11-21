@@ -1,22 +1,22 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Same-origin DSM 7 CGI reverse proxy for Google Photos Migrator.
 
-Forwards authenticated Synology DSM requests from:
-    https://<nas>:5001/webman/3rdparty/gphotos-migrator/proxy.cgi/<path>
-to the local background worker container at:
-    http://127.0.0.1:8765/<path>
+Synology DSM 7 nginx routes `/webman/3rdparty/.../*.cgi` (matching `\\.cgi$`
+without PATH_INFO). Therefore subpaths are passed via the `p` query parameter:
+    https://<nas>:5001/webman/3rdparty/gphotos-migrator/proxy.cgi?p=/api/status
+and forwarded to the local daemon at:
+    http://127.0.0.1:8765/api/status
 """
-
-from __future__ import annotations
 
 import os
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BACKEND_BASE = os.environ.get("GPHOTOS_BACKEND_URL", "http://127.0.0.1:8765").rstrip("/")
-PROXY_PREFIX = "/webman/3rdparty/gphotos-migrator/proxy.cgi"
+UI_PREFIX = "/webman/3rdparty/gphotos-migrator"
 AUTH_CGI = "/usr/syno/synoman/webman/authenticate.cgi"
 
 HOP_BY_HOP_HEADERS = {
@@ -32,7 +32,7 @@ HOP_BY_HOP_HEADERS = {
 }
 
 
-def get_dsm_user() -> str | None:
+def get_dsm_user():
     """Verify an active Synology DSM web session and return the authenticated DSM username."""
     if not os.path.isfile(AUTH_CGI):
         if os.environ.get("GPHOTOS_SKIP_DSM_AUTH") == "1":
@@ -46,32 +46,32 @@ def get_dsm_user() -> str | None:
             timeout=5,
             check=False,
         )
-        user = proc.stdout.strip()
+        user = (proc.stdout or "").strip()
         return user if user else None
     except Exception:
         return None
 
 
-def write_response(status: int, headers: list[tuple[str, str]], body: bytes) -> None:
+def write_response(status, headers, body):
     out = sys.stdout.buffer
-    out.write(f"Status: {status}\r\n".encode("ascii"))
+    out.write(("Status: %d\r\n" % status).encode("ascii"))
     for k, v in headers:
         if k.lower() in HOP_BY_HOP_HEADERS:
             continue
-        out.write(f"{k}: {v}\r\n".encode("latin-1", errors="ignore"))
-    out.write(f"Content-Length: {len(body)}\r\n".encode("ascii"))
+        out.write(("%s: %s\r\n" % (k, v)).encode("latin-1", errors="ignore"))
+    out.write(("Content-Length: %d\r\n" % len(body)).encode("ascii"))
     out.write(b"\r\n")
     out.write(body)
     out.flush()
 
 
-def render_backend_offline_html() -> bytes:
+def render_backend_offline_html():
     html = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta http-equiv="refresh" content="3" />
-<title>Google Photos Migrator — Starting Service</title>
+<title>Google Photos Migrator - Starting Service</title>
 <style>
   body{margin:0;background:#0b1120;color:#e5ecf6;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:40px 24px;line-height:1.55}
   .box{max-width:560px;margin:40px auto;background:#111827;border:1px solid #243047;border-radius:12px;padding:28px;text-align:center}
@@ -83,9 +83,9 @@ def render_backend_offline_html() -> bytes:
 </head>
 <body>
 <div class="box">
-  <h1>Starting Google Photos Migrator…</h1>
+  <h1>Starting Google Photos Migrator...</h1>
   <p>The background service is starting up. This window will connect automatically in a few seconds.</p>
-  <p style="font-size:0.85rem">If this message stays for more than 15 seconds, open <strong>Package Center → Installed → Google Photos Migrator</strong> and make sure its status is <strong>Running</strong>.</p>
+  <p style="font-size:0.85rem">If this message stays for more than 15 seconds, open <strong>Package Center &rarr; Installed &rarr; Google Photos Migrator</strong> and make sure its status is <strong>Running</strong>.</p>
   <button class="btn" onclick="window.location.reload()">Retry Now</button>
 </div>
 </body>
@@ -93,7 +93,33 @@ def render_backend_offline_html() -> bytes:
     return html.encode("utf-8")
 
 
-def main() -> None:
+def _extract_target_path_and_query():
+    raw_qs = os.environ.get("QUERY_STRING", "")
+    path_info = os.environ.get("PATH_INFO", "")
+
+    pairs = urllib.parse.parse_qsl(raw_qs, keep_blank_values=True)
+    target_path = None
+    forwarded_pairs = []
+    for k, v in pairs:
+        if k == "p" and target_path is None:
+            target_path = v
+        else:
+            forwarded_pairs.append((k, v))
+
+    if not target_path:
+        target_path = path_info if path_info else "/"
+
+    # Normalize & block any scheme or traversal attempts
+    if "://" in target_path or ".." in target_path.split("/"):
+        target_path = "/"
+    if not target_path.startswith("/"):
+        target_path = "/" + target_path
+
+    forwarded_qs = urllib.parse.urlencode(forwarded_pairs, doseq=True)
+    return target_path, forwarded_qs
+
+
+def main():
     dsm_user = get_dsm_user()
     if not dsm_user:
         write_response(
@@ -103,23 +129,13 @@ def main() -> None:
         )
         return
 
-    path_info = os.environ.get("PATH_INFO", "")
-    query_string = os.environ.get("QUERY_STRING", "")
-
-    # Ensure trailing slash on root so relative static/ and api/ paths resolve under proxy.cgi/
-    if path_info == "":
-        target = f"{PROXY_PREFIX}/"
-        if query_string:
-            target = f"{target}?{query_string}"
-        write_response(302, [("Location", target)], b"")
-        return
-
+    target_path, forwarded_qs = _extract_target_path_and_query()
     method = os.environ.get("REQUEST_METHOD", "GET").upper()
-    upstream_url = f"{BACKEND_BASE}{path_info}"
-    if query_string:
-        upstream_url = f"{upstream_url}?{query_string}"
+    upstream_url = BACKEND_BASE + target_path
+    if forwarded_qs:
+        upstream_url = upstream_url + "?" + forwarded_qs
 
-    req_body: bytes | None = None
+    req_body = None
     content_length_raw = os.environ.get("CONTENT_LENGTH", "").strip()
     if content_length_raw.isdigit() and int(content_length_raw) > 0:
         req_body = sys.stdin.buffer.read(int(content_length_raw))
@@ -129,9 +145,10 @@ def main() -> None:
         proto = "https"
     host = os.environ.get("HTTP_HOST", "")
 
-    headers: dict[str, str] = {
+    headers = {
         "X-Forwarded-Proto": proto,
-        "X-Forwarded-Prefix": PROXY_PREFIX,
+        "X-Forwarded-Prefix": UI_PREFIX,
+        "X-Proxy-Mode": "cgi",
         "X-DSM-User": dsm_user,
     }
     if host:
@@ -140,6 +157,8 @@ def main() -> None:
         headers["Content-Type"] = os.environ["CONTENT_TYPE"]
     if os.environ.get("HTTP_ACCEPT"):
         headers["Accept"] = os.environ["HTTP_ACCEPT"]
+    if os.environ.get("HTTP_X_PROFILE_ID"):
+        headers["X-Profile-Id"] = os.environ["HTTP_X_PROFILE_ID"]
 
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, hdrs, newurl):
@@ -152,14 +171,18 @@ def main() -> None:
         with opener.open(req, timeout=60) as resp:
             resp_headers = list(resp.headers.items())
             body = resp.read()
+            if target_path == "/" and b"static/styles.css" in body:
+                body = body.replace(b'href="static/styles.css"', b'href="proxy.cgi?p=/static/styles.css"')
+                body = body.replace(b'src="static/app.js"', b'src="proxy.cgi?p=/static/app.js"')
             write_response(resp.status, resp_headers, body)
     except urllib.error.HTTPError as err:
         resp_headers = list(err.headers.items()) if err.headers else [("Content-Type", "text/plain")]
         body = err.read() if err.fp else b""
         write_response(err.code, resp_headers, body)
     except (urllib.error.URLError, OSError):
+        # Return HTTP 200 so Synology DSM nginx does not replace our starting page with a generic 503 error page
         write_response(
-            503,
+            200,
             [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
             render_backend_offline_html(),
         )
