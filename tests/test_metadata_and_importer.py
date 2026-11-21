@@ -72,3 +72,36 @@ def test_apply_metadata_mtime_fallback_and_folder_importer(tmp_path: Path) -> No
     dest_abs2, dest_rel2 = importer.import_media(photo2, meta)
     assert dest_rel2 == "2024/07/IMG_5555_2.JPG"
     assert dest_abs2.exists()
+
+
+def test_apply_metadata_piexif_jpeg_fallback_without_exiftool(tmp_path: Path) -> None:
+    import piexif
+    from PIL import Image
+
+    jpeg_path = tmp_path / "sunset.jpg"
+    Image.new("RGB", (64, 48), (120, 80, 200)).save(jpeg_path, format="JPEG")
+
+    taken = datetime(2023, 8, 20, 18, 45, 12, tzinfo=UTC)
+    meta = PhotoMetadata(
+        taken_at=taken,
+        description="Pier sunset",
+        latitude=37.8199,
+        longitude=-122.4783,
+        altitude=12.5,
+    )
+
+    status = apply_metadata(
+        jpeg_path,
+        meta,
+        write_exif=True,
+        exiftool_path="nonexistent_exiftool_binary_for_test",
+    )
+    assert status == "repaired"
+    assert int(jpeg_path.stat().st_mtime) == int(taken.timestamp())
+
+    exif = piexif.load(str(jpeg_path))
+    assert exif["Exif"][piexif.ExifIFD.DateTimeOriginal] == b"2023:08:20 18:45:12"
+    assert exif["0th"][piexif.ImageIFD.ImageDescription] == b"Pier sunset"
+    assert exif["GPS"][piexif.GPSIFD.GPSLatitudeRef] == b"N"
+    assert exif["GPS"][piexif.GPSIFD.GPSLongitudeRef] == b"W"
+

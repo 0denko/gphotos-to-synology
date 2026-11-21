@@ -111,6 +111,53 @@ def _apply_file_mtime(media_path: Path, taken_at: datetime | None) -> None:
         logger.debug("Could not set mtime on %s: %s", media_path, exc)
 
 
+def _deg_to_dms_rational(deg: float) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    abs_deg = abs(deg)
+    d = int(abs_deg)
+    m_float = (abs_deg - d) * 60.0
+    m = int(m_float)
+    s = round((m_float - m) * 60.0 * 10000)
+    return ((d, 1), (m, 1), (s, 10000))
+
+
+def _apply_piexif_jpeg(media_path: Path, metadata: PhotoMetadata) -> bool:
+    """Pure-Python EXIF/GPS writer fallback for JPEGs when ExifTool isn't available."""
+    if media_path.suffix.lower() not in {".jpg", ".jpeg"}:
+        return False
+    try:
+        import piexif
+
+        try:
+            exif_dict = piexif.load(str(media_path))
+        except Exception:
+            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+
+        if metadata.taken_at is not None:
+            dt_bytes = metadata.taken_at.strftime("%Y:%m:%d %H:%M:%S").encode("ascii")
+            exif_dict["0th"][piexif.ImageIFD.DateTime] = dt_bytes
+            exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = dt_bytes
+            exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = dt_bytes
+
+        if metadata.description:
+            exif_dict["0th"][piexif.ImageIFD.ImageDescription] = metadata.description.encode("utf-8")
+
+        if metadata.has_gps and metadata.latitude is not None and metadata.longitude is not None:
+            exif_dict["GPS"][piexif.GPSIFD.GPSLatitudeRef] = b"N" if metadata.latitude >= 0 else b"S"
+            exif_dict["GPS"][piexif.GPSIFD.GPSLatitude] = _deg_to_dms_rational(metadata.latitude)
+            exif_dict["GPS"][piexif.GPSIFD.GPSLongitudeRef] = b"E" if metadata.longitude >= 0 else b"W"
+            exif_dict["GPS"][piexif.GPSIFD.GPSLongitude] = _deg_to_dms_rational(metadata.longitude)
+            if metadata.altitude is not None and abs(metadata.altitude) > 1e-7:
+                exif_dict["GPS"][piexif.GPSIFD.GPSAltitudeRef] = 0 if metadata.altitude >= 0 else 1
+                exif_dict["GPS"][piexif.GPSIFD.GPSAltitude] = (round(abs(metadata.altitude) * 100), 100)
+
+        exif_bytes = piexif.dump(exif_dict)
+        piexif.insert(exif_bytes, str(media_path))
+        return True
+    except Exception as exc:
+        logger.debug("piexif fallback failed for %s: %s", media_path.name, exc)
+        return False
+
+
 def apply_metadata(
     media_path: Path,
     metadata: PhotoMetadata,
@@ -119,7 +166,7 @@ def apply_metadata(
     write_album_tags: bool = True,
     exiftool_path: str = "exiftool",
 ) -> str:
-    """Write metadata into `media_path` using ExifTool and sync filesystem mtime.
+    """Write metadata into `media_path` using ExifTool (or pure-Python piexif) and sync mtime.
 
     Returns one of: 'repaired', 'mtime_only', 'skipped', 'error'.
     """
@@ -132,9 +179,14 @@ def apply_metadata(
     ):
         return "skipped"
 
-    if not write_exif or not exiftool_available(exiftool_path):
+    if not write_exif:
         _apply_file_mtime(media_path, metadata.taken_at)
         return "mtime_only"
+
+    if not exiftool_available(exiftool_path):
+        repaired_py = _apply_piexif_jpeg(media_path, metadata)
+        _apply_file_mtime(media_path, metadata.taken_at)
+        return "repaired" if repaired_py else "mtime_only"
 
     args: list[str] = [
         exiftool_path,

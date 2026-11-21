@@ -1,4 +1,4 @@
-name: Build and Publish Docker Image
+name: Build and Publish DSM 7 SPK & Docker Image
 
 on:
   push:
@@ -22,33 +22,103 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies, run tests & build DSM 7 SPK
+      - name: Install dependencies & run tests
         run: |
           pip install -e ".[dev]"
           ruff check src tests
           pytest -v
-          python synology-spk/build_spk.py
 
-      - name: Upload DSM 7 SPK to GitHub Release
+  build-standalone-spk:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            manylinux: quay.io/pypa/manylinux2014_x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            manylinux: quay.io/pypa/manylinux2014_aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build glibc-2.17 standalone binary & native DSM 7 SPK (${{ matrix.arch }})
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e APP_BUILD_SHA="${{ github.sha }}" \
+            ${{ matrix.manylinux }} \
+            /bin/bash -euxo pipefail -c '
+              # Install uv and use a managed Python 3.12 (python-build-standalone)
+              # which ships shared libpython3.12.so (required by PyInstaller) and targets glibc 2.17.
+              /opt/python/cp312-cp312/bin/pip install --no-cache-dir uv
+              /opt/python/cp312-cp312/bin/uv venv --python 3.12 --python-preference only-managed /tmp/build-venv
+              /opt/python/cp312-cp312/bin/uv pip install --python /tmp/build-venv/bin/python pyinstaller .
+
+              /tmp/build-venv/bin/python -m PyInstaller \
+                --noconfirm \
+                --clean \
+                --onedir \
+                --name gphotos-migrator \
+                --add-data "src/gphotos_synology/web/static:gphotos_synology/web/static" \
+                --hidden-import uvicorn.logging \
+                --hidden-import uvicorn.loops.auto \
+                --hidden-import uvicorn.protocols.http.auto \
+                --hidden-import uvicorn.protocols.websockets.auto \
+                --hidden-import uvicorn.lifespan.on \
+                --collect-all googleapiclient \
+                --collect-all google_auth_oauthlib \
+                synology-spk/entrypoint_bin.py
+
+              # Smoke test the compiled standalone binary directly inside manylinux2014
+              mkdir -p /tmp/smoke/config /tmp/smoke/work /tmp/smoke/inbox /tmp/smoke/photos
+              DATA_DIR=/tmp/smoke/config WORK_DIR=/tmp/smoke/work INBOX_DIR=/tmp/smoke/inbox PHOTOS_DIR=/tmp/smoke/photos \
+                APP_HOST=127.0.0.1 APP_PORT=18765 dist/gphotos-migrator/gphotos-migrator > /tmp/smoke/app.log 2>&1 &
+              SMOKE_PID=$!
+              for _ in $(seq 1 30); do
+                if curl -sf http://127.0.0.1:18765/api/health; then
+                  echo ""
+                  break
+                fi
+                sleep 0.5
+              done
+              curl -sf http://127.0.0.1:18765/api/health | grep -q "\"status\":\"ok\""
+              curl -sf http://127.0.0.1:18765/ | grep -q "Google Photos"
+              kill "$SMOKE_PID" || true
+              wait "$SMOKE_PID" 2>/dev/null || true
+
+              /tmp/build-venv/bin/python synology-spk/build_spk.py \
+                --arch ${{ matrix.arch }} \
+                --bundle-dir dist/gphotos-migrator \
+                --build-sha "${APP_BUILD_SHA}"
+            '
+
+      - name: Upload standalone SPK to GitHub Release v1.0.0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          SPK="dist/gphotos-migrator-dsm7-${{ matrix.arch }}.spk"
+          ls -lh "$SPK"
           if gh release view v1.0.0 >/dev/null 2>&1; then
-            gh release upload v1.0.0 dist/gphotos-migrator-dsm7.spk --clobber
+            gh release upload v1.0.0 "$SPK" --clobber
           else
-            gh release create v1.0.0 dist/gphotos-migrator-dsm7.spk \
-              --title "v1.0.0 — Native Synology DSM 7 App + Docker Engine" \
-              --notes "Install gphotos-migrator-dsm7.spk in Synology DSM Package Center -> Manual Install."
+            gh release create v1.0.0 "$SPK" \
+              --title "v1.1.0 — All-in-One Native Synology DSM 7 App (Zero Docker / Zero YAML)" \
+              --notes "Download the .spk for your Synology NAS CPU (x86_64 for Intel/AMD Plus models, arm64 for ARM models) and install via Package Center -> Manual Install."
           fi
 
-  publish:
+  publish-docker:
     needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU (for ARM64 Synology NAS support)
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx

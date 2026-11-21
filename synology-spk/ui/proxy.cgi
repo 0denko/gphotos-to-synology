@@ -70,60 +70,23 @@ def render_backend_offline_html() -> bytes:
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Google Photos Migrator — Start Background Service</title>
+<meta http-equiv="refresh" content="3" />
+<title>Google Photos Migrator — Starting Service</title>
 <style>
-  body{margin:0;background:#0b1120;color:#e5ecf6;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:32px;line-height:1.55}
-  .box{max-width:740px;margin:0 auto;background:#111827;border:1px solid #243047;border-radius:12px;padding:24px 28px}
-  h1{margin:0 0 8px;font-size:1.3rem}
-  p{color:#94a3b8;margin:0 0 16px}
-  pre{background:#060a14;border:1px solid #243047;border-radius:8px;padding:14px;overflow-x:auto;font-size:0.84rem;color:#93c5fd}
-  .btn{display:inline-block;background:#3b82f6;color:#fff;border:none;border-radius:8px;padding:9px 16px;font-weight:600;cursor:pointer;text-decoration:none}
+  body{margin:0;background:#0b1120;color:#e5ecf6;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:40px 24px;line-height:1.55}
+  .box{max-width:560px;margin:40px auto;background:#111827;border:1px solid #243047;border-radius:12px;padding:28px;text-align:center}
+  h1{margin:0 0 10px;font-size:1.3rem}
+  p{color:#94a3b8;margin:0 0 18px}
+  .btn{display:inline-block;background:#3b82f6;color:#fff;border:none;border-radius:8px;padding:9px 18px;font-weight:600;cursor:pointer}
   .btn:hover{background:#2563eb}
 </style>
 </head>
 <body>
 <div class="box">
-  <h1>Background Migrator Engine Is Not Running Yet</h1>
-  <p>This native DSM window is installed and ready! To start the background engine, open <strong>Container Manager → Project → Create</strong>, choose <strong>Create docker-compose.yml</strong>, paste the config below, and click <strong>Start</strong>:</p>
-<pre>services:
-  gphotos-migrator:
-    image: ghcr.io/0denko/gphotos-to-synology:latest
-    container_name: gphotos-to-synology
-    restart: unless-stopped
-    ports:
-      - "8765:8765"
-    environment:
-      - PUID=1026
-      - PGID=100
-      - TZ=America/Los_Angeles
-      - WATCHTOWER_URL=http://updater:8080
-      - WATCHTOWER_TOKEN=gphotos-internal-update-token
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
-      - "com.centurylinklabs.watchtower.scope=gphotos-migrator"
-    volumes:
-      - /volume1/docker/gphotos-migrator:/data
-      - /volume1/photo:/data/photos
-      - /volume1/homes:/data/homes
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-  updater:
-    image: nickfedor/watchtower:latest
-    container_name: gphotos-to-synology-updater
-    restart: unless-stopped
-    environment:
-      - WATCHTOWER_LABEL_ENABLE=true
-      - WATCHTOWER_SCOPE=gphotos-migrator
-      - WATCHTOWER_CLEANUP=true
-      - WATCHTOWER_POLL_INTERVAL=21600
-      - WATCHTOWER_HTTP_API_UPDATE=true
-      - WATCHTOWER_HTTP_API_PERIODIC_POLLS=true
-      - WATCHTOWER_HTTP_API_TOKEN=gphotos-internal-update-token
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock</pre>
-  <p style="font-size:0.85rem">Mounting <code>/volume1/homes:/data/homes</code> automatically enables the multi-user <strong>Synology User Picker</strong> for every family member's Personal Space.</p>
-  <button class="btn" onclick="window.location.reload()">Retry Connection</button>
+  <h1>Starting Google Photos Migrator…</h1>
+  <p>The background service is starting up. This window will connect automatically in a few seconds.</p>
+  <p style="font-size:0.85rem">If this message stays for more than 15 seconds, open <strong>Package Center → Installed → Google Photos Migrator</strong> and make sure its status is <strong>Running</strong>.</p>
+  <button class="btn" onclick="window.location.reload()">Retry Now</button>
 </div>
 </body>
 </html>"""

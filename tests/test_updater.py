@@ -29,9 +29,13 @@ def test_update_checker_detects_new_commit_and_up_to_date() -> None:
                     "html_url": "https://github.com/0denko/gphotos-to-synology/releases/tag/v1.0.1",
                     "assets": [
                         {
-                            "name": "gphotos-migrator-dsm7.spk",
-                            "browser_download_url": "https://github.com/0denko/gphotos-to-synology/releases/download/v1.0.1/gphotos-migrator-dsm7.spk",
-                        }
+                            "name": "gphotos-migrator-dsm7-arm64.spk",
+                            "browser_download_url": "https://github.com/0denko/gphotos-to-synology/releases/download/v1.0.1/gphotos-migrator-dsm7-arm64.spk",
+                        },
+                        {
+                            "name": "gphotos-migrator-dsm7-x86_64.spk",
+                            "browser_download_url": "https://github.com/0denko/gphotos-to-synology/releases/download/v1.0.1/gphotos-migrator-dsm7-x86_64.spk",
+                        },
                     ],
                 },
             )
@@ -53,7 +57,8 @@ def test_update_checker_detects_new_commit_and_up_to_date() -> None:
     assert res["latest_version"] == "1.0.1"
     assert res["latest_commit_message"] == "Add visual quality upgrade"
     assert res["auto_updater_configured"] is True
-    assert res["spk_download_url"].endswith("gphotos-migrator-dsm7.spk")
+    assert res["spk_download_url"].endswith(".spk")
+    assert ("arm64" in res["spk_download_url"]) or ("x86_64" in res["spk_download_url"])
 
     # Matching SHA -> update_available=False
     current_settings = Settings(app_build_sha="abcdef1234567890")

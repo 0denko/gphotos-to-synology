@@ -98,10 +98,9 @@ def create_app(
 def cli() -> None:
     settings = Settings()
     uvicorn.run(
-        "gphotos_synology.main:create_app",
-        host="0.0.0.0",
+        create_app(base_settings=settings),
+        host=settings.app_host,
         port=settings.app_port,
-        factory=True,
         reload=False,
     )
 

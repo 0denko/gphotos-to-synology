@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import platform
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -15,6 +16,13 @@ from gphotos_synology import __version__
 from gphotos_synology.config import Settings
 
 logger = logging.getLogger(__name__)
+
+
+def _host_spk_arch() -> str:
+    machine = (platform.machine() or "").lower()
+    if machine in {"aarch64", "arm64"}:
+        return "arm64"
+    return "x86_64"
 
 
 @dataclass
@@ -86,12 +94,13 @@ class UpdateService:
     ) -> UpdateStatus:
         repo = settings.github_repo.strip()
         current_sha = settings.app_build_sha.strip() or "dev"
+        arch = _host_spk_arch()
         status = UpdateStatus(
             current_version=__version__,
             current_sha=self._short_sha(current_sha),
             build_date=settings.app_build_date.strip(),
             release_url=f"https://github.com/{repo}/releases/latest",
-            spk_download_url=f"https://github.com/{repo}/raw/main/synology-spk/gphotos-migrator-dsm7.spk",
+            spk_download_url=f"https://github.com/{repo}/releases/latest/download/gphotos-migrator-dsm7-{arch}.spk",
             auto_updater_configured=bool(
                 settings.watchtower_url.strip() and settings.watchtower_token.strip()
             ),
@@ -123,7 +132,7 @@ class UpdateService:
             status.latest_commit_message = raw_msg[:140]
             status.latest_commit_date = commit_date
 
-            # 2. Check latest GitHub release tag & SPK asset URL (best-effort)
+            # 2. Check latest GitHub release tag & architecture-matching SPK asset URL
             try:
                 rel_resp = client.get(f"https://api.github.com/repos/{repo}/releases/latest")
                 if rel_resp.status_code == 200:
@@ -131,10 +140,20 @@ class UpdateService:
                     status.latest_version = str(rel_data.get("tag_name") or "").lstrip("v")
                     if rel_data.get("html_url"):
                         status.release_url = str(rel_data["html_url"])
+                    fallback_spk = ""
                     for asset in rel_data.get("assets") or []:
-                        if str(asset.get("name", "")).endswith(".spk") and asset.get("browser_download_url"):
-                            status.spk_download_url = str(asset["browser_download_url"])
+                        name = str(asset.get("name", ""))
+                        dl_url = str(asset.get("browser_download_url") or "")
+                        if not (name.endswith(".spk") and dl_url):
+                            continue
+                        if f"-{arch}.spk" in name:
+                            status.spk_download_url = dl_url
+                            fallback_spk = ""
                             break
+                        if not fallback_spk:
+                            fallback_spk = dl_url
+                    if fallback_spk:
+                        status.spk_download_url = fallback_spk
             except Exception:
                 pass
 

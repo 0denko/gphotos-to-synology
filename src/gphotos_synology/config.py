@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     homes_dir: Path = Field(default=Path("/data/homes"))
 
     # Server
+    app_host: str = Field(default="0.0.0.0")
     app_port: int = Field(default=8765)
 
     # Background polling & safety guards
@@ -117,9 +118,21 @@ class Settings(BaseSettings):
             self.work_dir,
             self.quarantine_dir,
             self.inbox_dir,
-            self.photos_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            self.photos_dir.mkdir(parents=True, exist_ok=True)
+
+    def is_photos_dir_writable(self) -> bool:
+        """Return True if the process can create/write files inside photos_dir."""
+        try:
+            self.photos_dir.mkdir(parents=True, exist_ok=True)
+            probe = self.photos_dir / f".gphotos_write_probe_{os.getpid()}"
+            probe.write_bytes(b"ok")
+            probe.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
 
 
 # Fields that can be safely modified from the Web UI and persisted across restarts

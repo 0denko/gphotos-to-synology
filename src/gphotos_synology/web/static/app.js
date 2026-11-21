@@ -113,7 +113,9 @@
     $("kpi-album-sync").textContent = `${stats.synced_album_items} synced · ${stats.pending_album_items} pending`;
     $("kpi-disk").textContent = `${disk.photos_free_gb} GB`;
     $("kpi-health").textContent =
-      `ExifTool: ${data.exiftool_available ? "OK" : "Missing"} · Drive: ${data.gdrive_connected ? "Linked" : "Local Inbox Only"}`;
+      `EXIF: ${data.exiftool_available ? "ExifTool" : "Built-in"} · Drive: ${data.gdrive_connected ? "Linked" : "Local Inbox Only"}`;
+
+    $("perm-banner").classList.toggle("hidden", data.photos_dir_writable !== false);
 
     // Progress bar
     $("worker-step").textContent = progress.current_step || "Idle";

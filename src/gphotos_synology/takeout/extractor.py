@@ -29,8 +29,13 @@ def extract_batch_key(filename: str) -> str:
 
 
 def get_free_disk_gb(path: Path) -> float:
-    path.mkdir(parents=True, exist_ok=True)
-    usage = shutil.disk_usage(path)
+    target = path
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        while not target.exists() and target != target.parent:
+            target = target.parent
+    usage = shutil.disk_usage(target)
     return usage.free / (1024**3)
 
 

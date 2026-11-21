@@ -47,35 +47,34 @@ Google Photos ──(Scheduled Incremental Takeout)──► Google Drive / NAS 
 
 ---
 
-## Quick Start on Synology DSM (Container Manager)
+## Quick Start on Synology DSM 7 (Recommended — Zero Docker, Zero YAML)
 
-### 1. Create Folders on Your NAS
+Install directly inside **Synology Package Center** as a native DSM 7 desktop app:
 
-Create the following directories in File Station (adjust `/volume1` if your volume differs):
+1. **Download the `.spk` file** for your NAS CPU from [GitHub Releases](https://github.com/0denko/gphotos-to-synology/releases/latest):
+   - **`gphotos-migrator-dsm7-x86_64.spk`** — for Intel / AMD Synology models (most `+`, `xs`, `fs`, and `DS920+` / `DS923+` / `DS224+` / `DS1522+` / `DS1821+` models).
+   - **`gphotos-migrator-dsm7-arm64.spk`** — for ARM64 Synology models (`DS223`, `DS223j`, `DS423`, `DS124`, `DS218`, etc.).
+2. **Install via Package Center**:
+   - Open **Package Center** in DSM → click **Manual Install** (top right) → select the `.spk` file → **Next** → **Agree** → **Done**.
+3. **Grant Photos Folder Permission (one-time)**:
+   - Open **Control Panel** → **Shared Folder** → select **`photo`** → **Edit** → **Permissions** → switch dropdown from *Local users* to **System internal user** → check **Read/Write** for **`gphotos-migrator`** → **Save**.
+   - *(Optional for multi-user Personal Spaces)* Repeat for the **`homes`** shared folder.
+4. Click **Google Photos Migrator** from the DSM Main Menu — the app opens right inside your Synology desktop!
 
-- `/volume1/docker/gphotos-migrator/config` — SQLite state DB, settings, OAuth tokens
-- `/volume1/docker/gphotos-migrator/work` — Temporary download/extract scratch space
-- `/volume1/docker/gphotos-migrator/inbox` — Optional local folder for manual or Synology Cloud Sync archives
+---
 
-### 2. Find Your Synology `PUID` and `PGID`
+## Alternative: Deploy with Docker / Container Manager
 
-SSH into your NAS and run:
-```bash
-id <your_dsm_username>
-```
-Typical Synology values are `PUID=1026` and `PGID=100` (`users`).
+If you prefer running via Docker with Watchtower auto-updates:
 
-### 3. Deploy with Docker Compose / Container Manager
-
-Copy `.env.example` to `.env`, adjust `PUID`, `PGID`, `TZ`, and the photo volume mount in `docker-compose.yml`:
-- **Personal Space**: `/volume1/homes/<your_dsm_username>/Photos:/data/photos`
-- **Shared Space**: `/volume1/photo:/data/photos`
-
-Then start the container:
-```bash
-docker compose up -d --build
-```
-Open the dashboard at `http://<YOUR_NAS_IP>:8765`.
+1. Copy `.env.example` to `.env`, adjust `PUID`, `PGID`, `TZ`, and the photo volume mount in `docker-compose.yml`:
+   - **Personal Space**: `/volume1/homes/<your_dsm_username>/Photos:/data/photos`
+   - **Shared Space**: `/volume1/photo:/data/photos`
+2. Start the container:
+   ```bash
+   docker compose up -d
+   ```
+3. Open the dashboard at `http://<YOUR_NAS_IP>:8765`.
 
 ---
 
