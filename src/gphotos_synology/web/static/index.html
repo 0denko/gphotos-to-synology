@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Google Photos → Synology DSM Migrator</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-icon" aria-hidden="true">GP</div>
+          <div>
+            <h1>Google Photos → Synology DSM</h1>
+            <p class="subtitle">Unattended Background Takeout Migration Service</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <span id="worker-badge" class="pill pill-muted">Connecting...</span>
+          <button id="btn-scan" class="btn btn-primary" type="button">Scan &amp; Sync Now</button>
+          <button id="btn-toggle-pause" class="btn btn-secondary" type="button">Pause</button>
+        </div>
+      </header>
+
+      <div id="toast" class="toast hidden" role="status"></div>
+
+      <div id="renewal-banner" class="banner banner-warn hidden">
+        <div>
+          <strong>Annual Google Takeout Renewal Due:</strong>
+          Google Takeout scheduled incremental exports expire after 1 year. Start a fresh schedule at
+          <a href="https://takeout.google.com" target="_blank" rel="noreferrer">takeout.google.com</a>,
+          then reset the timer.
+        </div>
+        <button id="btn-reset-renewal" class="btn btn-sm btn-secondary" type="button">
+          Reset Schedule Timer
+        </button>
+      </div>
+
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="overview" type="button">Overview</button>
+        <button class="tab" data-tab="upgrades" type="button">
+          Quality Upgrades <span id="upgrades-tab-badge" class="pill pill-muted hidden">0</span>
+        </button>
+        <button class="tab" data-tab="albums" type="button">Albums</button>
+        <button class="tab" data-tab="settings" type="button">Settings &amp; Connections</button>
+      </nav>
+
+      <!-- OVERVIEW TAB -->
+      <section id="tab-overview" class="tab-panel active">
+        <div class="kpi-grid">
+          <div class="card kpi">
+            <div class="kpi-label">Photos &amp; Videos Migrated</div>
+            <div id="kpi-media" class="kpi-value">0</div>
+            <div id="kpi-bytes" class="kpi-sub">0 B total · 0 EXIF repaired</div>
+          </div>
+          <div class="card kpi">
+            <div class="kpi-label">Duplicates Skipped</div>
+            <div id="kpi-dups" class="kpi-value">0</div>
+            <div id="kpi-archives" class="kpi-sub">0 archives completed</div>
+          </div>
+          <div class="card kpi">
+            <div class="kpi-label">Albums Tracked</div>
+            <div id="kpi-albums" class="kpi-value">0</div>
+            <div id="kpi-album-sync" class="kpi-sub">0 synced · 0 pending</div>
+          </div>
+          <div class="card kpi">
+            <div class="kpi-label">NAS Free Space</div>
+            <div id="kpi-disk" class="kpi-value">--</div>
+            <div id="kpi-health" class="kpi-sub">Checking ExifTool &amp; Drive...</div>
+          </div>
+        </div>
+
+        <div class="card progress-card">
+          <div class="card-header">
+            <div>
+              <h2>Live Background Worker</h2>
+              <p id="worker-step" class="muted">Loading status...</p>
+            </div>
+            <div class="meta-times">
+              <span id="last-run">Last run: --</span>
+              <span id="next-run">Next poll: --</span>
+            </div>
+          </div>
+          <div class="progress-track">
+            <div id="progress-bar" class="progress-bar" style="width: 0%"></div>
+          </div>
+          <div class="progress-footer">
+            <span id="progress-detail" class="muted">Idle</span>
+            <div class="inline-actions">
+              <button id="btn-index-existing" class="btn btn-sm btn-secondary" type="button">
+                Index Existing NAS Photos
+              </button>
+              <button id="btn-sync-albums" class="btn btn-sm btn-secondary" type="button">
+                Sync Pending Albums
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <h2>Processed Archives</h2>
+              <span class="muted">Google Drive &amp; Local Inbox</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Archive</th>
+                    <th>Source</th>
+                    <th>Status</th>
+                    <th>Imported</th>
+                    <th>Dups</th>
+                  </tr>
+                </thead>
+                <tbody id="archives-tbody">
+                  <tr>
+                    <td colspan="5" class="muted center">No archives processed yet.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2>Activity Log</h2>
+              <span class="muted">Auto-refreshing</span>
+            </div>
+            <div id="logs-container" class="log-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- QUALITY UPGRADES TAB -->
+      <section id="tab-upgrades" class="tab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h2>Visual Duplicate Quality Upgrades &amp; Quarantine</h2>
+              <p class="muted">
+                When visually identical photos differ in resolution or clarity, the higher-quality
+                image is kept in Synology Photos and the replaced lower-quality copy is safely
+                quarantined here for side-by-side review, restore, or purge.
+              </p>
+            </div>
+            <button id="btn-purge-all" class="btn btn-danger" type="button">
+              Purge All Quarantined
+            </button>
+          </div>
+          <div id="upgrades-list" class="upgrades-list">
+            <div class="muted center">No visual quality upgrades recorded yet.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ALBUMS TAB -->
+      <section id="tab-albums" class="tab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h2>Google Photos Albums</h2>
+              <p class="muted">
+                Deduplicated photos retain all album memberships. Enable the optional Synology DSM 7
+                Photos API in Settings to materialize these as native virtual albums.
+              </p>
+            </div>
+            <button id="btn-sync-albums-2" class="btn btn-primary" type="button">
+              Sync Virtual Albums Now
+            </button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Album Name</th>
+                  <th>Total Items</th>
+                  <th>Synced to Synology</th>
+                  <th>Pending</th>
+                  <th>Synology Album ID</th>
+                </tr>
+              </thead>
+              <tbody id="albums-tbody">
+                <tr>
+                  <td colspan="5" class="muted center">No albums detected yet.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- SETTINGS TAB -->
+      <section id="tab-settings" class="tab-panel">
+        <form id="settings-form" class="settings-grid">
+          <!-- Google Drive Card -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2>Google Drive Automation</h2>
+                <p class="muted">
+                  Schedule incremental Google Photos Takeout exports to Google Drive, then connect
+                  once for continuous background polling.
+                </p>
+              </div>
+              <span id="gdrive-badge" class="pill pill-muted">Not Connected</span>
+            </div>
+
+            <div class="field">
+              <label for="google_client_id">Google OAuth Client ID</label>
+              <input id="google_client_id" name="google_client_id" type="text" placeholder="xxxx.apps.googleusercontent.com" />
+            </div>
+            <div class="field">
+              <label for="google_client_secret">Google OAuth Client Secret</label>
+              <input id="google_client_secret" name="google_client_secret" type="password" placeholder="GOCSPX-..." />
+            </div>
+            <div class="field">
+              <label for="google_redirect_uri">OAuth Redirect URI (optional override)</label>
+              <input id="google_redirect_uri" name="google_redirect_uri" type="text" placeholder="Auto-detected from current URL" />
+              <small class="hint">
+                Add <code id="computed-redirect-uri"></code> as an Authorized Redirect URI in Google Cloud Console.
+              </small>
+            </div>
+
+            <div class="row-2">
+              <div class="field">
+                <label for="gdrive_folder_name">Drive Folder Name</label>
+                <input id="gdrive_folder_name" name="gdrive_folder_name" type="text" />
+              </div>
+              <div class="field">
+                <label for="gdrive_post_action">After Verified Import</label>
+                <select id="gdrive_post_action" name="gdrive_post_action">
+                  <option value="keep">Keep Archive in Drive (Read-Only Scope)</option>
+                  <option value="trash">Move Archive to Drive Trash (Reclaim Quota)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="inline-actions">
+              <button id="btn-gdrive-connect" class="btn btn-primary" type="button">
+                Connect Google Drive
+              </button>
+              <button id="btn-gdrive-disconnect" class="btn btn-danger" type="button">
+                Disconnect
+              </button>
+            </div>
+          </div>
+
+          <!-- Synology DSM 7 API Card -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2>Synology DSM 7 Photos API (Optional)</h2>
+                <p class="muted">
+                  Direct folder import is always active. Enable this toggle to also create native
+                  virtual albums in Synology Photos without duplicating files.
+                </p>
+              </div>
+            </div>
+
+            <label class="checkbox-row">
+              <input id="synology_api_enabled" name="synology_api_enabled" type="checkbox" />
+              <span>Enable Synology Photos virtual album sync</span>
+            </label>
+
+            <div class="row-2">
+              <div class="field">
+                <label for="synology_url">DSM URL</label>
+                <input id="synology_url" name="synology_url" type="text" placeholder="http://172.17.0.1:5000" />
+              </div>
+              <div class="field">
+                <label for="synology_space">Synology Photos Space</label>
+                <select id="synology_space" name="synology_space">
+                  <option value="personal">Personal Space (/homes/&lt;user&gt;/Photos)</option>
+                  <option value="shared">Shared Space (/photo)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="row-2">
+              <div class="field">
+                <label for="synology_username">DSM Username</label>
+                <input id="synology_username" name="synology_username" type="text" />
+              </div>
+              <div class="field">
+                <label for="synology_password">DSM Password</label>
+                <input id="synology_password" name="synology_password" type="password" />
+              </div>
+            </div>
+
+            <label class="checkbox-row">
+              <input id="synology_verify_ssl" name="synology_verify_ssl" type="checkbox" />
+              <span>Verify HTTPS SSL certificate</span>
+            </label>
+
+            <div class="inline-actions">
+              <button id="btn-test-synology" class="btn btn-secondary" type="button">
+                Test Synology Connection
+              </button>
+            </div>
+          </div>
+
+          <!-- Pipeline & Storage Card -->
+          <div class="card">
+            <div class="card-header">
+              <h2>Pipeline &amp; Organization</h2>
+            </div>
+
+            <div class="row-2">
+              <div class="field">
+                <label for="poll_interval_minutes">Background Poll Interval (minutes)</label>
+                <input id="poll_interval_minutes" name="poll_interval_minutes" type="number" min="1" max="10080" />
+              </div>
+              <div class="field">
+                <label for="min_free_disk_gb">Min Free NAS Disk Guard (GB)</label>
+                <input id="min_free_disk_gb" name="min_free_disk_gb" type="number" step="0.5" min="0.5" />
+              </div>
+            </div>
+
+            <div class="row-2">
+              <div class="field">
+                <label for="folder_template">Destination Folder Layout</label>
+                <select id="folder_template" name="folder_template">
+                  <option value="year_month">YYYY/MM (Recommended)</option>
+                  <option value="year_ym">YYYY/YYYY-MM</option>
+                  <option value="album">Albums/&lt;AlbumName&gt; (fallback YYYY/MM)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="inbox_post_action">Local Inbox Archive Post-Action</label>
+                <select id="inbox_post_action" name="inbox_post_action">
+                  <option value="move_to_processed">Move to /data/inbox/processed</option>
+                  <option value="delete">Delete after verified import</option>
+                  <option value="keep">Keep in place</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="row-2">
+              <div class="field">
+                <label for="dedup_mode">Duplicate Detection Mode</label>
+                <select id="dedup_mode" name="dedup_mode">
+                  <option value="perceptual">Visual Perceptual + Pixel + SHA-256 (Recommended)</option>
+                  <option value="exact_and_pixels">Exact SHA-256 + Decoded Pixel Hash</option>
+                  <option value="strict_hash">Strict Exact File SHA-256 Only</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="duplicate_quality_policy">When Visual Duplicate Has Higher Quality</label>
+                <select id="duplicate_quality_policy" name="duplicate_quality_policy">
+                  <option value="auto_upgrade_quarantine">Auto-upgrade &amp; quarantine replaced copy (Recommended)</option>
+                  <option value="keep_existing">Always keep existing NAS copy</option>
+                </select>
+              </div>
+            </div>
+
+            <label class="checkbox-row">
+              <input id="auto_index_existing_photos" name="auto_index_existing_photos" type="checkbox" />
+              <span>Auto-index existing Synology Photos before each migration run (prevents duplicating pre-existing NAS images)</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="write_exif_metadata" name="write_exif_metadata" type="checkbox" />
+              <span>Repair EXIF/XMP/QuickTime dates &amp; GPS from Takeout JSON via ExifTool</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="write_album_tags" name="write_album_tags" type="checkbox" />
+              <span>Write Google Photos album &amp; people names into XMP keyword tags</span>
+            </label>
+          </div>
+
+          <!-- Notifications Card -->
+          <div class="card">
+            <div class="card-header">
+              <h2>Alerts &amp; Notifications</h2>
+            </div>
+
+            <div class="row-2">
+              <div class="field">
+                <label for="webhook_type">Webhook Provider</label>
+                <select id="webhook_type" name="webhook_type">
+                  <option value="generic">Generic JSON POST</option>
+                  <option value="ntfy">ntfy.sh / Self-hosted ntfy</option>
+                  <option value="discord">Discord Webhook</option>
+                  <option value="slack">Slack Incoming Webhook</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="webhook_url">Webhook URL</label>
+                <input id="webhook_url" name="webhook_url" type="url" placeholder="https://ntfy.sh/my-synology-photos" />
+              </div>
+            </div>
+
+            <div class="row-2">
+              <div class="field">
+                <label for="smtp_host">SMTP Host (optional)</label>
+                <input id="smtp_host" name="smtp_host" type="text" placeholder="smtp.gmail.com" />
+              </div>
+              <div class="field">
+                <label for="smtp_to">Recipient Email</label>
+                <input id="smtp_to" name="smtp_to" type="email" placeholder="you@example.com" />
+              </div>
+            </div>
+
+            <div class="inline-actions">
+              <button id="btn-test-notify" class="btn btn-secondary" type="button">
+                Send Test Notification
+              </button>
+              <button type="submit" class="btn btn-primary">Save All Settings</button>
+            </div>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

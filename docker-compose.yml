@@ -1,0 +1,48 @@
+services:
+  gphotos-migrator:
+    build: .
+    image: gphotos-to-synology:latest
+    container_name: gphotos-to-synology
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8765}:8765"
+    environment:
+      - PUID=${PUID:-1026}
+      - PGID=${PGID:-100}
+      - TZ=${TZ:-UTC}
+      - DATA_DIR=/data/config
+      - WORK_DIR=/data/work
+      - INBOX_DIR=/data/inbox
+      - PHOTOS_DIR=/data/photos
+      - POLL_INTERVAL_MINUTES=${POLL_INTERVAL_MINUTES:-60}
+      - MIN_FREE_DISK_GB=${MIN_FREE_DISK_GB:-5.0}
+      - FOLDER_TEMPLATE=${FOLDER_TEMPLATE:-year_month}
+      - INBOX_POST_ACTION=${INBOX_POST_ACTION:-move_to_processed}
+      - GDRIVE_POST_ACTION=${GDRIVE_POST_ACTION:-keep}
+      - GDRIVE_FOLDER_NAME=${GDRIVE_FOLDER_NAME:-Takeout}
+      - WRITE_EXIF_METADATA=${WRITE_EXIF_METADATA:-true}
+      - WRITE_ALBUM_TAGS=${WRITE_ALBUM_TAGS:-true}
+      - AUTO_INDEX_EXISTING_PHOTOS=${AUTO_INDEX_EXISTING_PHOTOS:-true}
+      - DEDUP_MODE=${DEDUP_MODE:-perceptual}
+      - DUPLICATE_QUALITY_POLICY=${DUPLICATE_QUALITY_POLICY:-auto_upgrade_quarantine}
+      - SYNOLOGY_API_ENABLED=${SYNOLOGY_API_ENABLED:-false}
+      - SYNOLOGY_URL=${SYNOLOGY_URL:-http://172.17.0.1:5000}
+      - SYNOLOGY_USERNAME=${SYNOLOGY_USERNAME:-}
+      - SYNOLOGY_PASSWORD=${SYNOLOGY_PASSWORD:-}
+      - SYNOLOGY_SPACE=${SYNOLOGY_SPACE:-personal}
+      - SYNOLOGY_VERIFY_SSL=${SYNOLOGY_VERIFY_SSL:-false}
+      - WEBHOOK_URL=${WEBHOOK_URL:-}
+      - WEBHOOK_TYPE=${WEBHOOK_TYPE:-generic}
+    volumes:
+      # App config, SQLite state DB, and Google OAuth tokens
+      - /volume1/docker/gphotos-migrator/config:/data/config
+      # Temporary staging directory for downloads & extraction (needs space for 1 archive)
+      - /volume1/docker/gphotos-migrator/work:/data/work
+      # Watched local inbox folder for manual or Synology Cloud Sync Takeout archives
+      - /volume1/docker/gphotos-migrator/inbox:/data/inbox
+      # Target Synology Photos directory:
+      #   Personal Space: /volume1/homes/<YOUR_DSM_USER>/Photos
+      #   Shared Space:   /volume1/photo
+      - /volume1/homes/admin/Photos:/data/photos
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
