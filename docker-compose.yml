@@ -17,10 +17,10 @@ services:
     volumes:
       # App config, database, scratch work, quarantine & inbox (subfolders auto-created)
       - /volume1/docker/gphotos-migrator:/data
-      # Target Synology Photos folder:
-      #   Shared Space:   /volume1/photo:/data/photos
-      #   Personal Space: /volume1/homes/<YOUR_DSM_USER>/Photos:/data/photos
+      # Synology Photos Shared Space (/photo)
       - /volume1/photo:/data/photos
+      # All Synology users' Personal Spaces (/homes/<user>/Photos) for the User Picker
+      - /volume1/homes:/data/homes
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

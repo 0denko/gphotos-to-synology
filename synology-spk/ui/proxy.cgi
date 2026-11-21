@@ -32,11 +32,12 @@ HOP_BY_HOP_HEADERS = {
 }
 
 
-def is_dsm_authenticated() -> bool:
-    """Verify an active Synology DSM web session using DSM's built-in authenticate.cgi."""
+def get_dsm_user() -> str | None:
+    """Verify an active Synology DSM web session and return the authenticated DSM username."""
     if not os.path.isfile(AUTH_CGI):
-        # Allow local non-DSM unit tests to run cleanly
-        return os.environ.get("GPHOTOS_SKIP_DSM_AUTH") == "1"
+        if os.environ.get("GPHOTOS_SKIP_DSM_AUTH") == "1":
+            return os.environ.get("GPHOTOS_TEST_DSM_USER", "admin")
+        return None
     try:
         proc = subprocess.run(
             [AUTH_CGI],
@@ -45,9 +46,10 @@ def is_dsm_authenticated() -> bool:
             timeout=5,
             check=False,
         )
-        return bool(proc.stdout.strip())
+        user = proc.stdout.strip()
+        return user if user else None
     except Exception:
-        return False
+        return None
 
 
 def write_response(status: int, headers: list[tuple[str, str]], body: bytes) -> None:
@@ -102,6 +104,7 @@ def render_backend_offline_html() -> bytes:
     volumes:
       - /volume1/docker/gphotos-migrator:/data
       - /volume1/photo:/data/photos
+      - /volume1/homes:/data/homes
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -119,7 +122,7 @@ def render_backend_offline_html() -> bytes:
       - WATCHTOWER_HTTP_API_TOKEN=gphotos-internal-update-token
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock</pre>
-  <p style="font-size:0.85rem">For Synology Photos <strong>Personal Space</strong>, replace <code>/volume1/photo:/data/photos</code> with <code>/volume1/homes/&lt;YOUR_DSM_USER&gt;/Photos:/data/photos</code>.</p>
+  <p style="font-size:0.85rem">Mounting <code>/volume1/homes:/data/homes</code> automatically enables the multi-user <strong>Synology User Picker</strong> for every family member's Personal Space.</p>
   <button class="btn" onclick="window.location.reload()">Retry Connection</button>
 </div>
 </body>
@@ -128,7 +131,8 @@ def render_backend_offline_html() -> bytes:
 
 
 def main() -> None:
-    if not is_dsm_authenticated():
+    dsm_user = get_dsm_user()
+    if not dsm_user:
         write_response(
             403,
             [("Content-Type", "text/plain; charset=utf-8")],
@@ -165,6 +169,7 @@ def main() -> None:
     headers: dict[str, str] = {
         "X-Forwarded-Proto": proto,
         "X-Forwarded-Prefix": PROXY_PREFIX,
+        "X-DSM-User": dsm_user,
     }
     if host:
         headers["X-Forwarded-Host"] = host

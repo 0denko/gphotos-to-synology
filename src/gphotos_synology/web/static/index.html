@@ -27,6 +27,21 @@
 
       <div id="toast" class="toast hidden" role="status"></div>
 
+      <!-- SYNOLOGY USER PICKER BAR -->
+      <div class="user-bar">
+        <div class="user-bar-left">
+          <label for="profile-select" class="user-bar-label">Synology User:</label>
+          <select id="profile-select" class="user-select"></select>
+          <span id="profile-path-pill" class="pill pill-muted">/data/photos</span>
+          <span id="dsm-user-pill" class="pill pill-ok hidden"></span>
+        </div>
+        <div class="user-bar-right">
+          <button id="btn-manage-users" class="btn btn-sm btn-secondary" type="button">
+            + Add / Manage Users
+          </button>
+        </div>
+      </div>
+
       <div id="update-banner" class="banner banner-info hidden">
         <div>
           <strong>Update Available:</strong>
@@ -429,6 +444,68 @@
           </div>
         </form>
       </section>
+    </div>
+
+    <!-- ADD / MANAGE SYNOLOGY USERS MODAL -->
+    <div id="users-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="users-modal-title">
+      <div class="modal-card">
+        <div class="card-header">
+          <div>
+            <h2 id="users-modal-title">Synology Users &amp; Photo Spaces</h2>
+            <p class="muted" style="margin:3px 0 0;font-size:0.85rem">
+              Each user gets their own Google Drive connection, deduplication index, and Synology Photos destination.
+            </p>
+          </div>
+          <button id="btn-close-users-modal" class="btn btn-sm btn-secondary" type="button">Close</button>
+        </div>
+
+        <div id="discovered-users-box" class="discovered-box hidden">
+          <div class="kpi-label" style="margin-bottom:8px">Detected Synology Users (from /volume1/homes)</div>
+          <div id="discovered-users-chips" class="chip-row"></div>
+        </div>
+
+        <form id="add-user-form" class="add-user-form">
+          <div class="row-2">
+            <div class="field">
+              <label for="new-user-space">Target Synology Photos Space</label>
+              <select id="new-user-space" name="target_space">
+                <option value="personal">Personal Space (/homes/&lt;user&gt;/Photos)</option>
+                <option value="shared">Shared Space (/photo)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="new-user-dsm">Synology DSM Username</label>
+              <input id="new-user-dsm" name="dsm_username" type="text" placeholder="e.g. alex" />
+            </div>
+          </div>
+          <div class="row-2">
+            <div class="field">
+              <label for="new-user-display">Display Name (optional)</label>
+              <input id="new-user-display" name="display_name" type="text" placeholder="e.g. Alex (Personal)" />
+            </div>
+            <div class="field">
+              <label for="new-user-sub">Optional Subfolder</label>
+              <input id="new-user-sub" name="custom_subfolder" type="text" placeholder="Leave blank for root Photos" />
+            </div>
+          </div>
+          <button type="submit" class="btn btn-primary">Add User Profile</button>
+        </form>
+
+        <div class="table-wrap" style="margin-top:16px">
+          <table>
+            <thead>
+              <tr>
+                <th>Profile</th>
+                <th>Destination</th>
+                <th>Migrated</th>
+                <th>Active</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="profiles-tbody"></tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
     <script src="static/app.js"></script>

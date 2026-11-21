@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     work_dir: Path = Field(default=Path("/data/work"))
     inbox_dir: Path = Field(default=Path("/data/inbox"))
     photos_dir: Path = Field(default=Path("/data/photos"))
+    homes_dir: Path = Field(default=Path("/data/homes"))
 
     # Server
     app_port: int = Field(default=8765)

@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from gphotos_synology import __version__
 from gphotos_synology.config import ConfigManager, Settings
 from gphotos_synology.database import StateDB
+from gphotos_synology.profiles import ProfileRegistry
 from gphotos_synology.updater import UpdateService
 from gphotos_synology.web.routes import create_api_router
 from gphotos_synology.worker.pipeline import MigrationPipeline
@@ -25,6 +26,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "web" / "static"
 
 @dataclass
 class AppContext:
+    registry: ProfileRegistry
     config_manager: ConfigManager
     db: StateDB
     pipeline: MigrationPipeline
@@ -44,17 +46,23 @@ def create_app(
     *,
     start_worker: bool = True,
 ) -> FastAPI:
-    """Create and wire the FastAPI app with SQLite state, pipeline, and scheduler."""
+    """Create and wire the FastAPI app with multi-user ProfileRegistry, SQLite, and scheduler."""
     configure_logging()
-    config_manager = ConfigManager(base_settings=base_settings)
-    db = StateDB(config_manager.settings.db_path)
-    pipeline = MigrationPipeline(config_manager=config_manager, db=db)
-    scheduler = BackgroundScheduler(config_manager=config_manager, db=db, pipeline=pipeline)
+    settings = base_settings or Settings()
+    registry = ProfileRegistry(base_settings=settings)
+    default_ctx = registry.get_context("default")
+    scheduler = BackgroundScheduler(
+        config_manager=default_ctx.config_manager,
+        db=default_ctx.db,
+        pipeline=default_ctx.pipeline,
+        registry=registry,
+    )
     updater = UpdateService()
     ctx = AppContext(
-        config_manager=config_manager,
-        db=db,
-        pipeline=pipeline,
+        registry=registry,
+        config_manager=default_ctx.config_manager,
+        db=default_ctx.db,
+        pipeline=default_ctx.pipeline,
         scheduler=scheduler,
         updater=updater,
     )

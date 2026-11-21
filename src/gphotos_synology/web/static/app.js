@@ -7,6 +7,8 @@
     : `${window.location.pathname}/`;
   const urlFor = (relPath) => `${BASE_PATH}${relPath.replace(/^\/+/, "")}`;
 
+  let activeProfileId = "default";
+  let profilesCache = [];
   let isPaused = false;
   let toastTimer = null;
 
@@ -48,7 +50,11 @@
 
   async function apiFetch(url, options = {}) {
     const resp = await fetch(urlFor(url), {
-      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Profile-Id": activeProfileId,
+        ...(options.headers || {}),
+      },
       ...options,
     });
     const data = await resp.json().catch(() => ({}));
@@ -177,7 +183,7 @@
           <div class="compare-grid">
             <div class="compare-pane">
               <div><span class="pill pill-ok">Kept in Synology Photos</span> <strong>${escapeHtml(u.new_filename)}</strong></div>
-              <img src="${urlFor(`api/upgrades/${u.id}/preview/kept`)}" alt="Kept higher quality copy" loading="lazy" />
+              <img src="${urlFor(`api/upgrades/${u.id}/preview/kept?profile=${encodeURIComponent(activeProfileId)}`)}" alt="Kept higher quality copy" loading="lazy" />
               <div class="compare-meta">
                 <span>${u.new_width}×${u.new_height}</span>
                 <span>${formatBytes(u.new_file_size)}</span>
@@ -188,7 +194,7 @@
               <div><span class="pill pill-warn">Quarantined (Replaced)</span> <strong>${escapeHtml(u.old_filename)}</strong></div>
               ${
                 isQuarantined
-                  ? `<img src="${urlFor(`api/upgrades/${u.id}/preview/quarantined`)}" alt="Quarantined replaced copy" loading="lazy" />`
+                  ? `<img src="${urlFor(`api/upgrades/${u.id}/preview/quarantined?profile=${encodeURIComponent(activeProfileId)}`)}" alt="Quarantined replaced copy" loading="lazy" />`
                   : `<div class="muted center" style="padding:48px 10px">Quarantined file ${escapeHtml(u.status)}</div>`
               }
               <div class="compare-meta">
@@ -547,6 +553,188 @@
     }
   });
 
+  function updateProfilePathPill() {
+    const found = profilesCache.find((p) => p.id === activeProfileId);
+    if (found) {
+      $("profile-path-pill").textContent = found.photos_dir;
+    }
+  }
+
+  function renderProfilesModal(data) {
+    const discBox = $("discovered-users-box");
+    const chipsEl = $("discovered-users-chips");
+    const discovered = data.discovered_synology_users || [];
+    if (data.homes_mounted && discovered.length) {
+      discBox.classList.remove("hidden");
+      chipsEl.innerHTML = discovered
+        .map((u) => {
+          const disabled = u.already_configured ? "disabled" : "";
+          const label = u.already_configured ? `${u.username} (added)` : `+ Add ${u.username}`;
+          return `<button class="user-chip" type="button" data-quick-user="${escapeHtml(u.username)}" ${disabled}>${escapeHtml(label)}</button>`;
+        })
+        .join("");
+    } else {
+      discBox.classList.add("hidden");
+    }
+
+    const tbody = $("profiles-tbody");
+    tbody.innerHTML = (data.profiles || [])
+      .map((p) => {
+        const activeCls = p.enabled ? "pill-ok" : "pill-muted";
+        const delBtn = p.is_default
+          ? '<span class="muted">Default</span>'
+          : `<button class="btn btn-sm btn-danger" type="button" data-del-profile="${escapeHtml(p.id)}">Remove</button>`;
+        return `
+        <tr>
+          <td><strong>${escapeHtml(p.display_name)}</strong></td>
+          <td><code>${escapeHtml(p.photos_dir)}</code></td>
+          <td>${(p.stats && p.stats.total_media) || 0}</td>
+          <td>
+            <button class="pill ${activeCls}" style="border:none;cursor:pointer" type="button"
+              data-toggle-profile="${escapeHtml(p.id)}" data-enabled="${p.enabled ? "1" : "0"}">
+              ${p.enabled ? "Enabled" : "Disabled"}
+            </button>
+          </td>
+          <td>${delBtn}</td>
+        </tr>`;
+      })
+      .join("");
+  }
+
+  async function loadProfiles(selectOnInit = false) {
+    try {
+      const data = await apiFetch("/api/profiles");
+      profilesCache = data.profiles || [];
+
+      if (data.current_dsm_user) {
+        const pill = $("dsm-user-pill");
+        pill.textContent = `DSM: ${data.current_dsm_user}`;
+        pill.classList.remove("hidden");
+      }
+
+      if (selectOnInit) {
+        const urlProfile = new URLSearchParams(window.location.search).get("profile");
+        const savedProfile = window.localStorage.getItem("gphotos_active_profile");
+        const candidate = urlProfile || savedProfile || data.recommended_profile_id || "default";
+        activeProfileId = profilesCache.some((p) => p.id === candidate) ? candidate : "default";
+      } else if (!profilesCache.some((p) => p.id === activeProfileId)) {
+        activeProfileId = "default";
+      }
+
+      const sel = $("profile-select");
+      sel.innerHTML = profilesCache
+        .map((p) => {
+          const suffix = p.enabled ? "" : " (Paused)";
+          return `<option value="${escapeHtml(p.id)}">${escapeHtml(p.display_name)}${suffix}</option>`;
+        })
+        .join("");
+      sel.value = activeProfileId;
+      updateProfilePathPill();
+      renderProfilesModal(data);
+    } catch (err) {
+      console.error("Failed loading profiles:", err);
+    }
+  }
+
+  async function switchProfile(newId) {
+    activeProfileId = newId || "default";
+    window.localStorage.setItem("gphotos_active_profile", activeProfileId);
+    $("profile-select").value = activeProfileId;
+    updateProfilePathPill();
+    await Promise.all([loadSettings(), refreshDashboard()]);
+  }
+
+  $("profile-select").addEventListener("change", (e) => switchProfile(e.target.value));
+
+  $("btn-manage-users").addEventListener("click", async () => {
+    await loadProfiles(false);
+    $("users-modal").classList.remove("hidden");
+  });
+
+  $("btn-close-users-modal").addEventListener("click", () => {
+    $("users-modal").classList.add("hidden");
+  });
+
+  $("users-modal").addEventListener("click", (e) => {
+    if (e.target === $("users-modal")) {
+      $("users-modal").classList.add("hidden");
+    }
+  });
+
+  $("discovered-users-chips").addEventListener("click", async (e) => {
+    const chip = e.target.closest("[data-quick-user]");
+    if (!chip || chip.disabled) return;
+    const username = chip.dataset.quickUser;
+    try {
+      const res = await apiFetch("/api/profiles", {
+        method: "POST",
+        body: JSON.stringify({
+          dsm_username: username,
+          display_name: `${username} (Personal Space)`,
+          target_space: "personal",
+        }),
+      });
+      showToast(`Added Synology user '${username}'.`);
+      await loadProfiles(false);
+      await switchProfile(res.profile.id);
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  $("add-user-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    try {
+      const res = await apiFetch("/api/profiles", {
+        method: "POST",
+        body: JSON.stringify({
+          target_space: form.elements.target_space.value,
+          dsm_username: form.elements.dsm_username.value.trim(),
+          display_name: form.elements.display_name.value.trim(),
+          custom_subfolder: form.elements.custom_subfolder.value.trim(),
+        }),
+      });
+      form.reset();
+      showToast(`Added profile '${res.profile.display_name}'.`);
+      await loadProfiles(false);
+      await switchProfile(res.profile.id);
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  $("profiles-tbody").addEventListener("click", async (e) => {
+    const toggleBtn = e.target.closest("[data-toggle-profile]");
+    if (toggleBtn) {
+      const pid = toggleBtn.dataset.toggleProfile;
+      const nextEnabled = toggleBtn.dataset.enabled !== "1";
+      try {
+        await apiFetch(`/api/profiles/${encodeURIComponent(pid)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ enabled: nextEnabled }),
+        });
+        await loadProfiles(false);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+      return;
+    }
+
+    const delBtn = e.target.closest("[data-del-profile]");
+    if (delBtn) {
+      const pid = delBtn.dataset.delProfile;
+      try {
+        await apiFetch(`/api/profiles/${encodeURIComponent(pid)}`, { method: "DELETE" });
+        showToast("Profile removed (photos on NAS were kept untouched).");
+        await loadProfiles(false);
+        await switchProfile(activeProfileId);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+  });
+
   // Check OAuth callback query status
   const params = new URLSearchParams(window.location.search);
   if (params.get("oauth") === "success") {
@@ -557,9 +745,10 @@
     window.history.replaceState({}, "", BASE_PATH);
   }
 
-  loadSettings();
-  refreshDashboard();
-  checkUpdates(false);
-  setInterval(refreshDashboard, 4000);
-  setInterval(() => checkUpdates(false), 30 * 60 * 1000);
+  (async () => {
+    await loadProfiles(true);
+    await Promise.all([loadSettings(), refreshDashboard(), checkUpdates(false)]);
+    setInterval(refreshDashboard, 4000);
+    setInterval(() => checkUpdates(false), 30 * 60 * 1000);
+  })();
 })();
