@@ -237,11 +237,19 @@ def create_api_router() -> APIRouter:
     # ------------------------------------------------------------------
     # Google Drive OAuth2 Flow
     # ------------------------------------------------------------------
+    def _public_base_url(request: Request) -> str:
+        proto = request.headers.get("x-forwarded-proto")
+        host = request.headers.get("x-forwarded-host")
+        prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")
+        if proto and host:
+            return f"{proto}://{host}{prefix}"
+        return str(request.base_url).rstrip("/") + prefix
+
     def _resolve_redirect_uri(request: Request) -> str:
         settings = _ctx(request).config_manager.settings
         if settings.google_redirect_uri.strip():
             return settings.google_redirect_uri.strip()
-        return str(request.base_url).rstrip("/") + "/api/oauth/google/callback"
+        return f"{_public_base_url(request)}/api/oauth/google/callback"
 
     @router.get("/oauth/google/start")
     def google_oauth_start(request: Request) -> dict[str, Any]:
@@ -264,16 +272,18 @@ def create_api_router() -> APIRouter:
         error: str | None = None,
     ) -> RedirectResponse:
         ctx = _ctx(request)
+        base_prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")
+        home_url = f"{base_prefix}/"
         if error:
             ctx.db.log_event("ERROR", "oauth", f"Google OAuth returned error: {error}")
-            return RedirectResponse(url=f"/?oauth=error&detail={error}", status_code=302)
+            return RedirectResponse(url=f"{home_url}?oauth=error&detail={error}", status_code=302)
         if not code:
-            return RedirectResponse(url="/?oauth=error&detail=missing_code", status_code=302)
+            return RedirectResponse(url=f"{home_url}?oauth=error&detail=missing_code", status_code=302)
 
         expected_state = ctx.db.get_state("oauth_state")
         if expected_state and state != expected_state:
             ctx.db.log_event("ERROR", "oauth", "Google OAuth state mismatch")
-            return RedirectResponse(url="/?oauth=error&detail=state_mismatch", status_code=302)
+            return RedirectResponse(url=f"{home_url}?oauth=error&detail=state_mismatch", status_code=302)
 
         gdrive = GoogleDriveClient(ctx.config_manager.settings)
         redirect_uri = _resolve_redirect_uri(request)
@@ -281,10 +291,10 @@ def create_api_router() -> APIRouter:
             gdrive.exchange_code(code=code, redirect_uri=redirect_uri)
             ctx.db.log_event("INFO", "oauth", "Google Drive connected successfully")
             ctx.scheduler.trigger_now(albums_only=False)
-            return RedirectResponse(url="/?oauth=success", status_code=302)
+            return RedirectResponse(url=f"{home_url}?oauth=success", status_code=302)
         except Exception as exc:
             ctx.db.log_event("ERROR", "oauth", f"OAuth token exchange failed: {exc}")
-            return RedirectResponse(url="/?oauth=error&detail=token_exchange_failed", status_code=302)
+            return RedirectResponse(url=f"{home_url}?oauth=error&detail=token_exchange_failed", status_code=302)
 
     @router.post("/oauth/google/disconnect")
     def google_oauth_disconnect(request: Request) -> dict[str, Any]:

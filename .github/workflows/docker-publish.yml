@@ -27,6 +27,7 @@ jobs:
           pip install -e ".[dev]"
           ruff check src tests
           pytest -v
+          python synology-spk/build_spk.py
 
   publish:
     needs: test

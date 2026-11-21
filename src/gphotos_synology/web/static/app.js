@@ -1,6 +1,12 @@
 (() => {
   const $ = (id) => document.getElementById(id);
 
+  // Supports both root (http://nas:8765/) and Synology DSM proxy (/webman/3rdparty/gphotos-migrator/proxy.cgi/)
+  const BASE_PATH = window.location.pathname.endsWith("/")
+    ? window.location.pathname
+    : `${window.location.pathname}/`;
+  const urlFor = (relPath) => `${BASE_PATH}${relPath.replace(/^\/+/, "")}`;
+
   let isPaused = false;
   let toastTimer = null;
 
@@ -41,7 +47,7 @@
   }
 
   async function apiFetch(url, options = {}) {
-    const resp = await fetch(url, {
+    const resp = await fetch(urlFor(url), {
       headers: { "Content-Type": "application/json", ...(options.headers || {}) },
       ...options,
     });
@@ -171,7 +177,7 @@
           <div class="compare-grid">
             <div class="compare-pane">
               <div><span class="pill pill-ok">Kept in Synology Photos</span> <strong>${escapeHtml(u.new_filename)}</strong></div>
-              <img src="/api/upgrades/${u.id}/preview/kept" alt="Kept higher quality copy" loading="lazy" />
+              <img src="${urlFor(`api/upgrades/${u.id}/preview/kept`)}" alt="Kept higher quality copy" loading="lazy" />
               <div class="compare-meta">
                 <span>${u.new_width}×${u.new_height}</span>
                 <span>${formatBytes(u.new_file_size)}</span>
@@ -182,7 +188,7 @@
               <div><span class="pill pill-warn">Quarantined (Replaced)</span> <strong>${escapeHtml(u.old_filename)}</strong></div>
               ${
                 isQuarantined
-                  ? `<img src="/api/upgrades/${u.id}/preview/quarantined" alt="Quarantined replaced copy" loading="lazy" />`
+                  ? `<img src="${urlFor(`api/upgrades/${u.id}/preview/quarantined`)}" alt="Quarantined replaced copy" loading="lazy" />`
                   : `<div class="muted center" style="padding:48px 10px">Quarantined file ${escapeHtml(u.status)}</div>`
               }
               <div class="compare-meta">
@@ -278,7 +284,7 @@
   }
 
   async function loadSettings() {
-    $("computed-redirect-uri").textContent = `${window.location.origin}/api/oauth/google/callback`;
+    $("computed-redirect-uri").textContent = `${window.location.origin}${urlFor("api/oauth/google/callback")}`;
     try {
       const { settings } = await apiFetch("/api/settings");
       const form = $("settings-form");
@@ -384,7 +390,13 @@
     if (!saved) return;
     try {
       const { authorization_url } = await apiFetch("/api/oauth/google/start");
-      window.location.href = authorization_url;
+      if (window.self !== window.top) {
+        // Google OAuth blocks iframe embedding; open consent in a new tab and auto-refresh here
+        window.open(authorization_url, "_blank", "noopener");
+        showToast("Complete Google sign-in in the new tab — this DSM window will update automatically.");
+      } else {
+        window.location.href = authorization_url;
+      }
     } catch (err) {
       showToast(err.message, true);
     }
@@ -462,10 +474,10 @@
   const params = new URLSearchParams(window.location.search);
   if (params.get("oauth") === "success") {
     showToast("Google Drive connected! Initial background scan started.");
-    window.history.replaceState({}, "", "/");
+    window.history.replaceState({}, "", BASE_PATH);
   } else if (params.get("oauth") === "error") {
     showToast(`Google OAuth error: ${params.get("detail") || "unknown"}`, true);
-    window.history.replaceState({}, "", "/");
+    window.history.replaceState({}, "", BASE_PATH);
   }
 
   loadSettings();

@@ -1,0 +1,3 @@
+[app]
+app_name = "Google Photos Migrator"
+description = "Unattended Google Photos to Synology Photos background migration"
