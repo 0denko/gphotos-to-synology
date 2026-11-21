@@ -35,6 +35,7 @@ def create_api_router() -> APIRouter:
         settings = ctx.config_manager.settings
         return {
             "status": "ok",
+            "build_sha": settings.app_build_sha[:7] if settings.app_build_sha else "dev",
             "worker_running": ctx.scheduler.is_running,
             "worker_paused": ctx.scheduler.is_paused,
             "exiftool_available": exiftool_available(settings.exiftool_path),
@@ -134,6 +135,27 @@ def create_api_router() -> APIRouter:
         ctx = _ctx(request)
         purged = ctx.pipeline.purge_all_quarantined()
         return {"ok": True, "purged": purged}
+
+    # ------------------------------------------------------------------
+    # Software Updates (GitHub check + Watchtower self-update)
+    # ------------------------------------------------------------------
+    @router.get("/updates")
+    def check_updates(request: Request, force: bool = False) -> dict[str, Any]:
+        ctx = _ctx(request)
+        settings = ctx.config_manager.settings
+        return ctx.updater.get_status(settings, force=force)
+
+    @router.post("/updates/apply")
+    def apply_update(request: Request) -> dict[str, Any]:
+        ctx = _ctx(request)
+        settings = ctx.config_manager.settings
+        try:
+            res = ctx.updater.trigger_self_update(settings)
+            ctx.db.log_event("INFO", "updater", "Self-update triggered via Watchtower")
+            return res
+        except Exception as exc:
+            ctx.db.log_event("WARNING", "updater", f"Self-update trigger failed: {exc}")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.get("/settings")
     def get_settings(request: Request) -> dict[str, Any]:

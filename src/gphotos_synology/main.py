@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from gphotos_synology import __version__
 from gphotos_synology.config import ConfigManager, Settings
 from gphotos_synology.database import StateDB
+from gphotos_synology.updater import UpdateService
 from gphotos_synology.web.routes import create_api_router
 from gphotos_synology.worker.pipeline import MigrationPipeline
 from gphotos_synology.worker.scheduler import BackgroundScheduler
@@ -28,6 +29,7 @@ class AppContext:
     db: StateDB
     pipeline: MigrationPipeline
     scheduler: BackgroundScheduler
+    updater: UpdateService
 
 
 def configure_logging() -> None:
@@ -48,11 +50,13 @@ def create_app(
     db = StateDB(config_manager.settings.db_path)
     pipeline = MigrationPipeline(config_manager=config_manager, db=db)
     scheduler = BackgroundScheduler(config_manager=config_manager, db=db, pipeline=pipeline)
+    updater = UpdateService()
     ctx = AppContext(
         config_manager=config_manager,
         db=db,
         pipeline=pipeline,
         scheduler=scheduler,
+        updater=updater,
     )
 
     @asynccontextmanager

@@ -470,6 +470,83 @@
     }
   });
 
+  let currentBuildSha = "";
+
+  function renderUpdateStatus(u, notifyIfCurrent = false) {
+    currentBuildSha = u.current_sha || "";
+    const verLabel = `v${u.current_version}${u.current_sha ? ` · ${u.current_sha}` : ""}`;
+    $("version-badge").textContent = verLabel;
+
+    const banner = $("update-banner");
+    if (u.update_available) {
+      const msg = u.latest_commit_message ? ` — ${u.latest_commit_message}` : "";
+      $("update-banner-text").textContent =
+        `${u.current_sha} → ${u.latest_sha}${msg}`;
+      $("link-download-spk").href = u.spk_download_url || u.release_url || "#";
+      const applyBtn = $("btn-apply-update");
+      applyBtn.textContent = u.auto_updater_configured ? "Update Now" : "Pull Latest in Container Manager";
+      applyBtn.disabled = !u.auto_updater_configured;
+      banner.classList.remove("hidden");
+    } else {
+      banner.classList.add("hidden");
+      if (notifyIfCurrent) {
+        if (u.error) {
+          showToast(u.error, true);
+        } else {
+          showToast(`Up to date (${verLabel}).`);
+        }
+      }
+    }
+  }
+
+  async function checkUpdates(force = false) {
+    try {
+      const data = await apiFetch(`/api/updates?force=${force ? "true" : "false"}`);
+      renderUpdateStatus(data, force);
+    } catch (err) {
+      if (force) showToast(`Update check failed: ${err.message}`, true);
+    }
+  }
+
+  function waitForReconnectAfterUpdate(previousSha) {
+    let attempts = 0;
+    const poll = setInterval(async () => {
+      attempts++;
+      try {
+        const health = await apiFetch("/api/health");
+        if (health && health.status === "ok" && (health.build_sha !== previousSha || attempts >= 8)) {
+          clearInterval(poll);
+          showToast("Update complete! Reloading dashboard...");
+          setTimeout(() => window.location.reload(), 800);
+        }
+      } catch {
+        // Expected while Watchtower stops & starts the new container
+      }
+      if (attempts >= 45) {
+        clearInterval(poll);
+        showToast("Update still restarting — click Reload once the container is back.", true);
+      }
+    }, 3000);
+  }
+
+  $("btn-check-updates").addEventListener("click", () => checkUpdates(true));
+
+  $("btn-apply-update").addEventListener("click", async () => {
+    const prevSha = currentBuildSha;
+    const btn = $("btn-apply-update");
+    btn.disabled = true;
+    btn.textContent = "Updating...";
+    try {
+      const res = await apiFetch("/api/updates/apply", { method: "POST" });
+      showToast(res.message || "Update started — restarting container...");
+      waitForReconnectAfterUpdate(prevSha);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = "Update Now";
+      showToast(err.message, true);
+    }
+  });
+
   // Check OAuth callback query status
   const params = new URLSearchParams(window.location.search);
   if (params.get("oauth") === "success") {
@@ -482,5 +559,7 @@
 
   loadSettings();
   refreshDashboard();
+  checkUpdates(false);
   setInterval(refreshDashboard, 4000);
+  setInterval(() => checkUpdates(false), 30 * 60 * 1000);
 })();

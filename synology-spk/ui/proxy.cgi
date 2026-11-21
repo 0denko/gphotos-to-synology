@@ -94,11 +94,31 @@ def render_backend_offline_html() -> bytes:
       - PUID=1026
       - PGID=100
       - TZ=America/Los_Angeles
+      - WATCHTOWER_URL=http://updater:8080
+      - WATCHTOWER_TOKEN=gphotos-internal-update-token
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "com.centurylinklabs.watchtower.scope=gphotos-migrator"
     volumes:
       - /volume1/docker/gphotos-migrator:/data
       - /volume1/photo:/data/photos
     extra_hosts:
-      - "host.docker.internal:host-gateway"</pre>
+      - "host.docker.internal:host-gateway"
+
+  updater:
+    image: nickfedor/watchtower:latest
+    container_name: gphotos-to-synology-updater
+    restart: unless-stopped
+    environment:
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_SCOPE=gphotos-migrator
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=21600
+      - WATCHTOWER_HTTP_API_UPDATE=true
+      - WATCHTOWER_HTTP_API_PERIODIC_POLLS=true
+      - WATCHTOWER_HTTP_API_TOKEN=gphotos-internal-update-token
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock</pre>
   <p style="font-size:0.85rem">For Synology Photos <strong>Personal Space</strong>, replace <code>/volume1/photo:/data/photos</code> with <code>/volume1/homes/&lt;YOUR_DSM_USER&gt;/Photos:/data/photos</code>.</p>
   <button class="btn" onclick="window.location.reload()">Retry Connection</button>
 </div>

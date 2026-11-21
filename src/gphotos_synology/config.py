@@ -85,6 +85,14 @@ class Settings(BaseSettings):
     # Annual Takeout schedule reminder
     takeout_renewal_reminder_days: int = Field(default=335, ge=30, le=365)
 
+    # Software updates (GitHub release/commit check + optional Watchtower self-updater)
+    github_repo: str = Field(default="0denko/gphotos-to-synology")
+    app_build_sha: str = Field(default="dev")
+    app_build_date: str = Field(default="")
+    auto_check_updates: bool = Field(default=True)
+    watchtower_url: str = Field(default="")
+    watchtower_token: str = Field(default="")
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "state.db"
@@ -149,12 +157,14 @@ MUTABLE_UI_FIELDS: set[str] = {
     "smtp_to",
     "smtp_use_tls",
     "takeout_renewal_reminder_days",
+    "auto_check_updates",
 }
 
 SECRET_FIELDS: set[str] = {
     "google_client_secret",
     "synology_password",
     "smtp_password",
+    "watchtower_token",
 }
 
 

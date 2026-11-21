@@ -17,13 +17,30 @@
           </div>
         </div>
         <div class="topbar-actions">
+          <span id="version-badge" class="pill pill-muted">v1.0.0</span>
           <span id="worker-badge" class="pill pill-muted">Connecting...</span>
+          <button id="btn-check-updates" class="btn btn-secondary" type="button">Check Updates</button>
           <button id="btn-scan" class="btn btn-primary" type="button">Scan &amp; Sync Now</button>
           <button id="btn-toggle-pause" class="btn btn-secondary" type="button">Pause</button>
         </div>
       </header>
 
       <div id="toast" class="toast hidden" role="status"></div>
+
+      <div id="update-banner" class="banner banner-info hidden">
+        <div>
+          <strong>Update Available:</strong>
+          <span id="update-banner-text">A newer version is available on GitHub.</span>
+        </div>
+        <div class="inline-actions" style="margin-top:0">
+          <button id="btn-apply-update" class="btn btn-sm btn-primary" type="button">
+            Update Now
+          </button>
+          <a id="link-download-spk" class="btn btn-sm btn-secondary" href="#" target="_blank" rel="noreferrer">
+            DSM App (.spk)
+          </a>
+        </div>
+      </div>
 
       <div id="renewal-banner" class="banner banner-warn hidden">
         <div>

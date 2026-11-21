@@ -4,9 +4,14 @@ LABEL org.opencontainers.image.source="https://github.com/0denko/gphotos-to-syno
       org.opencontainers.image.description="Unattended background migration of Google Photos Takeout archives to Synology DSM / Synology Photos" \
       org.opencontainers.image.licenses="MIT"
 
+ARG APP_BUILD_SHA="dev"
+ARG APP_BUILD_DATE=""
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    APP_BUILD_SHA="${APP_BUILD_SHA}" \
+    APP_BUILD_DATE="${APP_BUILD_DATE}"
 
 # Install ExifTool (metadata repair), gosu (Synology PUID/PGID), and tzdata
 RUN apt-get update && apt-get install -y --no-install-recommends \
