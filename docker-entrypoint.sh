@@ -19,6 +19,6 @@ fi
 
 # Ensure writable application directories exist
 mkdir -p "${DATA_DIR:-/data/config}" "${WORK_DIR:-/data/work}" "${INBOX_DIR:-/data/inbox}" "${PHOTOS_DIR:-/data/photos}"
-chown -R "${PUID}:${PGID}" "${DATA_DIR:-/data/config}" "${WORK_DIR:-/data/work}" || true
+chown -R "${PUID}:${PGID}" "${DATA_DIR:-/data/config}" "${WORK_DIR:-/data/work}" "${INBOX_DIR:-/data/inbox}" || true
 
 exec gosu "${PUID}:${PGID}" "$@"
