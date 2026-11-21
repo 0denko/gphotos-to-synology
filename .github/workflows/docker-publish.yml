@@ -57,7 +57,8 @@ jobs:
               # which ships shared libpython3.12.so (required by PyInstaller) and targets glibc 2.17.
               /opt/python/cp312-cp312/bin/pip install --no-cache-dir uv
               /opt/python/cp312-cp312/bin/uv venv --python 3.12 --python-preference only-managed /tmp/build-venv
-              /opt/python/cp312-cp312/bin/uv pip install --python /tmp/build-venv/bin/python pyinstaller .
+              /opt/python/cp312-cp312/bin/uv pip install --python /tmp/build-venv/bin/python --only-binary :all: -r pyproject.toml pyinstaller
+              /opt/python/cp312-cp312/bin/uv pip install --python /tmp/build-venv/bin/python --no-deps .
 
               /tmp/build-venv/bin/python -m PyInstaller \
                 --noconfirm \
@@ -86,8 +87,8 @@ jobs:
                 fi
                 sleep 0.5
               done
-              curl -sf http://127.0.0.1:18765/api/health | grep -q "\"status\":\"ok\""
-              curl -sf http://127.0.0.1:18765/ | grep -q "Google Photos"
+              curl -sf http://127.0.0.1:18765/api/health | grep -q "\"status\":\"ok\"" || { cat /tmp/smoke/app.log; exit 1; }
+              curl -sf http://127.0.0.1:18765/ | grep -q "Google Photos" || { cat /tmp/smoke/app.log; exit 1; }
               kill "$SMOKE_PID" || true
               wait "$SMOKE_PID" 2>/dev/null || true
 
