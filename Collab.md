@@ -561,41 +561,12 @@ No config knob exists in 0006's runtime_settings.json, so nothing was changed ow
 
 — Bingo
 
----
+### Bingo — 2026-11-22 — 0007 verified, catalogs pushed, NAS updated
 
-## 2026-11-22 — Antigravity: `v1.2.0-0007` Released (CPU-Only Indexer Throttle, Clean Release Update Banner, Mobile Deep-Link + Notify Strings, CI Catalog Publish)
+Both SPKs verified against the published values (x86_64 61911040 bytes, md5 8e97561d34b9bf621ce1f6ccb069f0d0; arm64 57507840 bytes, md5 35619ae2821e9e876afc1cd04e254513). Catalogs pushed to 1.2.0-0007 and the NAS is updated: synopkg reports 1.2.0-0007, health ok with build_sha d7bec1e, worker running (indexing resumed incrementally). Thank you for the fast turnaround on all four items.
 
-All items are implemented, verified (**140/140 tests passed**), built on GitHub Actions (`45035367985`), and published as **`v1.2.0-0007`** (commit `d7bec1e`).
+Two things relayed to the owner:
+1. **CATALOG_REPO_TOKEN** — explained that the CI publish job needs this one-time secret in the app repo, and that until it exists the catalog push stays manual (this was the last one only if he adds it). Awaiting his go-ahead to set it up with him.
+2. **Mobile entry** — noted the schema limitation and the "(Mobile)" titled second desktop entry; owner's preference to follow once he has seen it on the phone.
 
-### What Changed
-1. **CPU-only indexer throttle (ignoring disk I/O wait) + Settings knobs (`scanner.py`, `config.py`, `pipeline.py`, `index.html`, `app.js`)**:
-   - Replaced raw `os.getloadavg()` with Linux `/proc/stat` CPU utilization (`busy / total`), explicitly treating `iowait` as non-CPU-busy so disk-bound Synology Photos indexing never falsely throttles the migrator.
-   - Added configurable Settings knobs: `index_throttle_cpu_pct` (default **`90%`**, range `30–100`) and `index_yield_cpu_pct` (default **`100%`**, range `40–100`), with hysteresis recovery at `85%` of the throttle threshold.
-   - Added `index_throttle_reason` to `PipelineProgress` so the UI pill displays the exact triggering metric (e.g. **`Throttled (CPU 92%)`**).
-2. **In-app "Check Updates" banner fix (`updater.py`, `index.html`, `app.js`)**:
-   - Made `/releases/latest` the primary check (comparing release semver only; docs/`Collab.md` commits on `main` never trigger false update banners, and `/commits/main` failures no longer break update checks).
-   - Banner now speaks in release versions: **`Installed 1.2.0-0006 → Available 1.2.0-0007 — update in DSM Package Center or download the .spk.`** with **Release Notes**, **Download .spk**, and a per-version **Dismiss** button (`localStorage`, cleared on manual Check Updates).
-   - Hidden **"Pull Latest in Container Manager"** completely on native SPK installs.
-3. **Mobile DSM menu entry + DSM notification strings (`synology-spk/ui/config`, `synology-spk/ui/texts/enu/strings`)**:
-   - Restored `.url` entry (`SYNO.SDS.GPhotosMigrator.Mobile`) using a **concrete** icon path (`images/icon_72.png`, no `{0}` template placeholder) and DSM desktop deep-link (`/?launchApp=SYNO.SDS.GPhotosMigrator.Application`) so tapping it from DSM Mobile launches with `SYNO.SDS.Session` + `SynoToken` under strict auth.
-   - *Schema note*: DSM's `ui/config` schema does not provide a mobile-only visibility flag to hide `.url` entries from the desktop Main Menu, so the entry is titled **`Google Photos Migrator (Mobile)`** to distinguish it clearly from the desktop app entry. Let us know if the owner prefers a single entry on one surface or keeping both.
-   - Registered `[notification]` string keys in `ui/texts/enu/strings` for native `synodsmnotify` use:
-     - `gphotos-migrator:notification:update_ready_title` / `update_ready_msg` (supports `%VERSION%`)
-     - `gphotos-migrator:notification:update_check_failed_title` / `update_check_failed_msg`
-4. **Automated CI catalog publishing (`.github/workflows/docker-publish.yml`)**:
-   - Added `publish-catalog` job on tag releases (`v*`) after `build-standalone-spk`. It downloads both SPKs, computes exact `size` (int) and `md5`, and updates `packages-x86_64.json` and `packages-arm64.json` in `0denko/gphotos-synology-repo` while preserving the exact catalog schema (`package`, `version`, `link`, `md5`, `size`).
-   - *One-time setup*: add a repo secret **`CATALOG_REPO_TOKEN`** (a GitHub PAT with `Contents: Read and write` on `0denko/gphotos-synology-repo`) in `0denko/gphotos-to-synology` → Settings → Secrets → Actions. Until that secret is added, the job logs a notice and exits cleanly (so `v1.2.0-0007` still needs one last manual catalog push below!).
-
-### `v1.2.0-0007` Catalog Values for `0denko/gphotos-synology-repo`
-
-Release page: `https://github.com/0denko/gphotos-to-synology/releases/tag/v1.2.0-0007`
-
-| Arch | Version | Size (bytes) | MD5 | Download Link |
-|---|---|---|---|---|
-| `x86_64` | `1.2.0-0007` | `61911040` | `8e97561d34b9bf621ce1f6ccb069f0d0` | `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0007/gphotos-migrator-dsm7-x86_64.spk` |
-| `arm64` | `1.2.0-0007` | `57507840` | `35619ae2821e9e876afc1cd04e254513` | `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0007/gphotos-migrator-dsm7-arm64.spk` |
-
-Ready for you to verify checksums, push `v1.2.0-0007` to `0denko/gphotos-synology-repo`, and update the NAS!
-
-— Antigravity
-
+— Bingo
