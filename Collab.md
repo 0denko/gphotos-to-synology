@@ -202,3 +202,40 @@ Requested by the user: iPhone photos arrive as HEIC/HEIF, which much of the ecos
 - **Testing:** add coverage alongside the existing visual-quality tests — HEIC import lands as a fingerprinted JPEG; metadata, GPS and orientation preserved; Live Photo pair intact; corrupt HEIC falls back to the original; all three modes exercised.
 
 — Bingo
+
+### 2026-11-21 — Bingo — DSM 7.3 field findings: authenticate.cgi is dead; dashboard + OAuth callback broken on 7.3 — thorough review + rebuild requested
+
+**Status: findings from live debugging on the user's NAS tonight, with a fix spec. Request to Antigravity: (1) a thorough review pass over the whole app for other DSM-version-sensitive assumptions, (2) implement the fix below, (3) rebuild and release as 1.2.0-0002. The user chose the proper fix only — no hot-patch of the installed copy; his NAS stays on 1.2.0-0001 until 0002 ships.**
+
+**Test environment (all findings verified live, not inferred):** DS3622xs+ (broadwellnk), DSM 7.3.2-86009, v1.2.0-0001 installed from the self-hosted package source. Backend healthy throughout: `GET /api/health` → 200, worker running, build `d423d8c`.
+
+**Symptom:** the DSM app window shows DSM's "Sorry, the page you are looking for is not found." That page is misleading — it is `proxy.cgi`'s **403** rendered through DSM's `error_page` template, not a routing 404.
+
+**Ruled out by direct tests on the NAS:**
+- Arch/platform: broadwellnk is in the SPK INFO arch list; install succeeds from the x86_64 catalog.
+- DSM 7.3 routes and executes third-party `.cgi` in the package `ui/` folder fine: throwaway sh and python CGIs placed in our own `ui/` folder served 200 in the same folder, as the package user. The `webman/3rdparty/gphotos-migrator` symlink, file ownership and `+x` bits are all correct, and `/usr/bin/python3` exists (3.8).
+- The backend serves the full dashboard on `127.0.0.1:8765`; only the DSM-window path fails.
+
+**Root cause:** `get_dsm_user()` — duplicated in `synology-spk/ui/proxy.cgi` and `synology-spk/ui/oauth_callback.cgi` — execs `/usr/syno/synoman/webman/authenticate.cgi` and parses the username from its stdout. On DSM 7.3 that helper cannot validate current desktop sessions:
+- With the owner's **real browser sessions** (phone and laptop; cookies `_SSID`, `id`, `did`, `stay_login`), `authenticate.cgi` run as a child of a diagnostic CGI exits **7** and prints nothing. The dashboard can therefore never open, and the Google OAuth callback — same helper — fails the same way.
+- Sessions created via `SYNO.API.Auth` (session=webman) are the old type: the helper returns the user **only when the request's source address equals the login address** (verified in both directions); from any other address it exits **5**. DSM's `skip_checksrcip="yes"` (Control Panel → Security → skip IP checking) does **not** change the helper's behavior.
+- `authenticate.cgi` is not usable over HTTP either (DSM answers with its error page).
+- For reference: Tailscale's DSM 7 package does not use `authenticate.cgi` at all (its `index.cgi` just execs its own web UI).
+
+**What works instead (verified live):** a server-side HTTPS call to DSM's webapi with the browser's `Cookie` header forwarded — `SYNO.Core.Desktop.Initdata` (v1, `get`) returns success for a valid session even when the CGI's source address differs from the login address, and needs no SynoToken. Caveat: the Initdata payload does **not** contain the username, so it proves session validity only, and at ~465 KB it is too heavy to fetch per request.
+
+**Fix spec:**
+1. **One shared session helper** for both CGIs (the logic is currently duplicated — dedupe it, or keep both copies byte-identical in behavior).
+2. **Session validation via the webapi:** forward the request's `Cookie` header to `https://localhost:5001/webapi/entry.cgi` and treat success as a valid DSM session. Pick the cheapest auth-required API that reliably distinguishes valid/invalid sessions (evaluate lighter `SYNO.Core.*` calls before falling back to Initdata), and do not pay that cost on every request — see the bridge in step 4. The loopback call uses DSM's self-signed cert; if TLS verification is skipped for loopback, say why in a comment.
+3. **Identity from the desktop context:** `GPhotosMigrator.js` runs inside the authenticated DSM desktop, where `SYNO.SDS.Session` is populated (its `SynoToken` property is confirmed present in DSM 7.3's SDS lib — find the username equivalent) — pass the DSM username to `proxy.cgi` on the initial iframe load. Server-side: validate against the existing `DSM_USER_RE`, require administrators-group membership via `grp` (as today) for dashboard access, and keep profile binding exactly as the C2 fix intends. **Fail closed:** no username from the desktop context → an explanatory error page, never the dashboard.
+4. **Session bridge for subsequent calls:** the dashboard's API calls can't carry the JS-supplied name. After a successful steps 2+3 validation, mint a package session cookie (HttpOnly, SameSite=Lax, path-scoped to the app folder) bound to the DSM session — e.g. keyed to a hash of the DSM `id` cookie plus the validated username, stored server-side in the package var dir with an expiry. Valid bridge cookie → skip re-validation. Expiry or a changed DSM session → re-run steps 2+3. A DSM logout or user switch must not leave a usable bridge.
+5. **`oauth_callback.cgi`:** same helper. The callback arrives as a top-level navigation with DSM cookies but no JS context — accept the bridge cookie when present, otherwise validate the session via step 2 and take the username from the flow's server-side state. The OAuth `state` binding to the initiating profile (backend-side) must stay intact.
+6. **Keep unchanged:** the `X-Proxy-Secret` + `X-DSM-User`/`X-DSM-Admin` contract to the backend, the backend's C1/C2 enforcement, and the `GPHOTOS_SKIP_DSM_AUTH` / `GPHOTOS_TEST_DSM_USER` test hooks (extend them across the new path).
+7. **Tests:** valid _SSID-style session (authenticate.cgi failing) accepted via webapi validation; invalid/expired session → 403; asserted non-admin → rejected; bridge cookie issued, reused, expired, and invalidated when the DSM session changes; OAuth callback via bridge cookie and via fresh webapi validation; full suite green.
+8. **Release:** bump coherently to **1.2.0-0002** (`pyproject.toml`, `__version__`, SPK `VERSION`), tag a new release so the workflow publishes both SPKs, then update the catalogs in `0denko/gphotos-synology-repo` (`packages.json`, `packages-x86_64.json`, `packages-arm64.json`) with the new version, links, sizes and md5s.
+
+**Related catalog bug found the same night:** with both arch entries in one `packages.json`, DSM downloaded the **arm64** SPK for the x86_64 NAS and the install failed with "package does not support the current arch / model" (NAS `synoscgi.log`, error 281, 22:59). The single-arch catalogs work. Either find the catalog field DSM needs to choose correctly, or make the per-arch catalogs the documented default in that repo's README.
+
+**Review request:** this bug survived two review rounds because it only manifests with real DSM 7.3 browser sessions — CI and API-created sessions both mask it. Please re-audit the whole app for other DSM ≤7.2 assumptions (CGI environment, DSM APIs, nginx routing, SPK lifecycle on 7.3) and append your findings to this file, then rebuild per the spec above. I'll verify 1.2.0-0002 on the user's NAS the same way as tonight: installed-package behavior, not just the test suite.
+
+— Bingo
