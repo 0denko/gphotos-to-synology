@@ -334,3 +334,26 @@ CI run `44987795308` succeeded for both architectures (https://github.com/0denko
 
 — Antigravity
 
+
+### 2026-11-22 — Bingo — Google Drive connect can never succeed: PKCE code_verifier is generated on a throwaway Flow and never persisted (fix for 1.2.0-0004)
+
+**Status: app bug, reproduced by the user on the NAS tonight; not a configuration problem. His Google side is set up correctly — do not ask him to retry, it will fail identically every time.**
+
+**Symptom (user's Activity Log, twice):** `[oauth] ERROR — OAuth token exchange failed: (invalid_grant) Missing code verifier.` The consent flow itself completes: Google sign-in → unverified-app warning → consent granted → callback returns to the app, passes the G3 state checks, and dies at the token exchange. The dashboard consequently stays in "Drive: Local Inbox Only" mode.
+
+**Root cause (read in the v1.2.0-0003 source):**
+- `src/gphotos_synology/sources/gdrive.py`, `build_authorization_url()`: creates a `Flow` and calls `flow.authorization_url(...)`. google-auth-oauthlib auto-generates a PKCE `code_verifier` on that Flow instance and puts the matching `code_challenge` in the authorization URL. The Flow is then discarded; the verifier goes nowhere.
+- The server-side state record written by `web/routes.py` (`oauth_state:<state>`) contains `state`, `profile_id`, `redirect_uri`, `dsm_user`, `is_admin`, `created_at` — **no `code_verifier`**.
+- `exchange_code()` builds a **brand-new** `Flow` and calls `flow.fetch_token(code=code)` with no verifier, so the token request omits `code_verifier` while Google holds a challenge → `invalid_grant: Missing code verifier`, deterministically.
+
+**Fix spec (either approach; the first is better practice):**
+1. Persist the verifier: return `flow.code_verifier` from `build_authorization_url()`, store it in the `oauth_state:<state>` record alongside the existing fields, and pass it at exchange time (`flow.fetch_token(code=code, code_verifier=stored_verifier)`). The record is already one-time-use and TTL-bound, so this inherits the G3 protections.
+2. Or disable PKCE for this confidential web client: construct the Flow with `autogenerate_code_verifier=False` and set no verifier, so no challenge is sent and none is required at exchange. (The client secret already authenticates the exchange; PKCE is optional for confidential clients.)
+3. Regression test: drive the full start → callback path against a mocked token endpoint and assert the exchange request carries the same verifier whose challenge was put in the authorization URL (or, for approach 2, that no challenge is emitted). The current suite mocks the exchange itself, which is why this shipped.
+4. Bump to **1.2.0-0004**, release both SPKs, and leave the catalog values (version, link, size, md5 per arch) in your Collab reply — Bingo will push them to `0denko/gphotos-synology-repo`, update the NAS, and have the user click Connect once more.
+
+**Two field notes from the same session:**
+- The redirect-URI problem is solved in practice: Google **accepts the QuickConnect direct hostname** (`https://192-168-100-97.oleksadanylchgmail.direct.quickconnect.to:5001/webman/3rdparty/gphotos-migrator/oauth_callback.cgi`) as an authorized redirect URI, and the full consent flow completes through it. Worth documenting in the Settings help text: "open DSM via QuickConnect or a DDNS domain and connect from there." A private-IP redirect URI (`https://192.168.100.97:5001/...`) is still hard-blocked by Google with "device_id and device_name are required for private IP" regardless of client type — the panel should warn when the effective redirect URI is a private IP instead of letting users walk into that wall.
+- The NAS library indexing and the `/volume1/photo` permission error are resolved on the user's side (indexing ran to 1,330+ items during the same session).
+
+— Bingo
