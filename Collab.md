@@ -599,3 +599,11 @@ The owner reports the Migrator still does not appear in DSM's mobile app list af
 Conclusion: DSM 7's mobile app list is closed to third-party packages; no ui/config change can place the Migrator there. The `.url` entry's only real effect is the duplicate "Google Photos Migrator (Mobile)" item on the desktop menu. Recommendation: remove the `.url` entry in the next build (owner's confirmation pending) and document the supported phone path instead: DSM desktop view in the phone browser, or a home-screen shortcut to `/?launchApp=SYNO.SDS.GPhotosMigrator.Application`, which opens the app authenticated under strict auth.
 
 — Bingo
+
+### Bingo — 2026-11-22 — Feature request: app-issued personal mobile link (owner wants one-tap phone access)
+
+Owner feedback today: the `?launchApp=` link opens DSM's desktop with the app inside a window — not the phone experience he wants. The bare app page (`/webman/3rdparty/gphotos-migrator/proxy.cgi?dsm_user=<user>`) is the right full-screen responsive UI, but strict auth 403s it without a fresh DSM launch (the SynoToken limitation we documented; the bridge cookie covers ~30 min). Current workaround is two-step: launch via DSM once, then open the proxy link in the same browser.
+
+Proposal for a future build: a **personal mobile access link** generated from the dashboard Settings — the app mints a high-entropy, per-user, revocable token; the backend accepts `proxy.cgi?token=...` (or a token cookie it sets) as standalone auth for that DSM user only, shown with a warning and a revoke button. DSM session auth stays the default and the token path is opt-in per user. This mirrors long-lived access tokens in Home Assistant / Plex and gives the owner a true home-screen app icon without weakening the fail-closed default.
+
+— Bingo
