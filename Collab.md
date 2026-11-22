@@ -185,3 +185,20 @@ Happy to re-verify fixes commit by commit, same as AstroDrive — and the pendin
 - **Merged to `main`** at the user's direction ("fix and merge"). With C1, C2, G1 and G8 fixed and verified, the **release hold is lifted**. Version is now **1.2.0** (`pyproject.toml`, `__version__`, and SPK `1.2.0-0001`). No release has been tagged yet.
 
 — Bingo
+
+### 2026-11-21 — Bingo — Feature proposal: automatic HEIC/HEIF transcoding on import
+
+**Status: feature proposal for Antigravity to implement. Not part of the v1.2.0 release.**
+
+Requested by the user: iPhone photos arrive as HEIC/HEIF, which much of the ecosystem (some Synology Photos clients, most non-Apple software) still handles poorly. Proposal: transcode HEIC/HEIF stills to high-quality JPEG automatically during import.
+
+- **Where in the pipeline:** convert during import, BEFORE dedup fingerprinting. The converted JPEG is what gets fingerprinted and stored, so tiers 2/3 and the quality-upgrade path apply to iPhone photos natively. This is also the complete form of the G10 fix: v1.2.0 made HEIC fingerprintable via pillow-heif, but the library still stores HEIC — transcoding normalizes the stored format too.
+- **Quality:** JPEG quality configurable, suggested default 90-92, full resolution preserved.
+- **Metadata:** EXIF orientation, timestamps and GPS must carry into the converted JPEG (orientation applied consistently — baked in or tag preserved, never double-applied). The existing sidecar metadata-repair path (photoTakenTime, description, GPS from the JSON sidecar) must apply to the converted file exactly as it does to a native JPEG today.
+- **Never silently destroy the original:** per-profile setting with three modes — *replace* (JPEG in the library, original HEIC moved to quarantine with the same restore/purge lifecycle as replaced duplicates), *keep both*, and *keep original only* (transcoding off). Proposed safe default: **replace with quarantine** — the library stays clean, the original stays recoverable until the user purges quarantine, and quarantined originals inherit the G8 uninstall backup.
+- **Live Photos:** a HEIC that is the still half of a Live Photo pair must keep its pairing with the .MOV component (same asset association as today, video untouched). If pairing cannot be preserved for an asset, skip transcoding that asset rather than break the pair.
+- **Failure handling:** a file that fails to decode or transcode is imported as the original HEIC, untouched, with a warning logged. Transcoding must never become a new way to lose or block a photo (the G1 lesson).
+- **Implementation notes:** a HEIF decoder is already in the dependency set for fingerprinting (pillow-heif, G10), but decoding every iPhone photo at full resolution is heavier than fingerprinting — check the SPK bundle-size impact of libheif on both architectures and the CPU cost on low-end NAS models before committing to it. Run transcoding inside the existing worker and its concurrency limits, not on the request path. Record in the DB that an item was transcoded (source format, quarantine path of the original) so logs and UI can show it.
+- **Testing:** add coverage alongside the existing visual-quality tests — HEIC import lands as a fingerprinted JPEG; metadata, GPS and orientation preserved; Live Photo pair intact; corrupt HEIC falls back to the original; all three modes exercised.
+
+— Bingo
