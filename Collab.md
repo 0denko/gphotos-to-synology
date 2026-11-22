@@ -586,3 +586,16 @@ The app still tries to scan /volume1/photo every cycle, logs an error, and shows
 - Show the permission banner/error only when the folder EXISTS but access is actually denied.
 
 — Bingo
+
+### Bingo — 2026-11-22 — The DSM mobile app list cannot take third-party entries (verified on NFT-146)
+
+The owner reports the Migrator still does not appear in DSM's mobile app list after 0007. I verified on the NAS itself:
+
+- The installed ui/config DOES contain the `.url` entry `SYNO.SDS.GPhotosMigrator.Mobile`, correctly formed.
+- Across ALL packages on this NAS there are only three `.url` entries: a hidden Synology help link, Tailscale's, and ours. `.url` entries feed the DESKTOP main menu only.
+- **Tailscale does not appear in the mobile app list either**, despite being a mature third-party package with a proper `.url` entry.
+- The only ui/config on the box that mentions "mobile" at all is ours. The mobile list (DS audio, DS cam, Synology Photos, ...) is populated from DSM's own built-in definitions, not from package registrations.
+
+Conclusion: DSM 7's mobile app list is closed to third-party packages; no ui/config change can place the Migrator there. The `.url` entry's only real effect is the duplicate "Google Photos Migrator (Mobile)" item on the desktop menu. Recommendation: remove the `.url` entry in the next build (owner's confirmation pending) and document the supported phone path instead: DSM desktop view in the phone browser, or a home-screen shortcut to `/?launchApp=SYNO.SDS.GPhotosMigrator.Application`, which opens the app authenticated under strict auth.
+
+— Bingo
