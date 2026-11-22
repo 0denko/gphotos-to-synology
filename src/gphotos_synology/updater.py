@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import platform
 import re
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,6 +28,10 @@ def _host_spk_arch() -> str:
     if machine in {"aarch64", "arm64"}:
         return "arm64"
     return "x86_64"
+
+
+def _is_native_spk_install() -> bool:
+    return bool(getattr(sys, "frozen", False)) or Path("/var/packages/gphotos-migrator").is_dir()
 
 
 def _parse_semver(version: str) -> tuple[int, int, int, int] | None:
@@ -63,6 +69,7 @@ class UpdateStatus:
     spk_download_url: str = ""
     spk_sha256_url: str = ""
     auto_updater_configured: bool = False
+    is_spk_install: bool = False
     checked_at: str | None = None
     error: str = ""
     release_error: str = ""
@@ -130,6 +137,7 @@ class UpdateService:
             auto_updater_configured=bool(
                 settings.watchtower_url.strip() and settings.watchtower_token.strip()
             ),
+            is_spk_install=_is_native_spk_install(),
             checked_at=datetime.now(UTC).isoformat(),
         )
 
@@ -145,24 +153,7 @@ class UpdateService:
             },
         )
         try:
-            # 1. Check latest commit on main (informational metadata)
-            commit_resp = client.get(f"https://api.github.com/repos/{repo}/commits/main")
-            commit_resp.raise_for_status()
-            commit_data = commit_resp.json()
-            full_latest_sha = str(commit_data.get("sha") or "")
-            commit_obj = commit_data.get("commit") or {}
-            raw_msg = (
-                str(commit_obj.get("message") or "").splitlines()[0]
-                if commit_obj.get("message")
-                else ""
-            )
-            commit_date = str((commit_obj.get("committer") or {}).get("date") or "")
-
-            status.latest_sha = self._short_sha(full_latest_sha)
-            status.latest_commit_message = raw_msg[:140]
-            status.latest_commit_date = commit_date
-
-            # 2. Check latest GitHub release tag, SPK asset URL & .sha256 checksum URL
+            # 1. Primary: check latest GitHub release tag, SPK asset URL & .sha256 checksum URL
             try:
                 rel_resp = client.get(f"https://api.github.com/repos/{repo}/releases/latest")
                 if rel_resp.status_code == 200:
@@ -187,22 +178,36 @@ class UpdateService:
                         status.spk_download_url = fallback_spk
                 else:
                     status.release_error = f"GitHub release check returned HTTP {rel_resp.status_code}"
-                    if not status.error:
-                        status.error = status.release_error
+                    status.error = status.release_error
             except Exception as exc:
                 status.release_error = f"Release check failed: {exc}"
-                if not status.error:
-                    status.error = status.release_error
+                status.error = status.release_error
                 logger.warning("GitHub release check failed: %s", exc)
 
-            # G7: Never report a downgrade as an update — require strictly newer semver when available
+            # 2. Optional diagnostic metadata: latest commit on main (never drives update_available)
+            try:
+                commit_resp = client.get(f"https://api.github.com/repos/{repo}/commits/main")
+                if commit_resp.status_code == 200:
+                    commit_data = commit_resp.json()
+                    full_latest_sha = str(commit_data.get("sha") or "")
+                    commit_obj = commit_data.get("commit") or {}
+                    raw_msg = (
+                        str(commit_obj.get("message") or "").splitlines()[0]
+                        if commit_obj.get("message")
+                        else ""
+                    )
+                    commit_date = str((commit_obj.get("committer") or {}).get("date") or "")
+                    status.latest_sha = self._short_sha(full_latest_sha)
+                    status.latest_commit_message = raw_msg[:140]
+                    status.latest_commit_date = commit_date
+            except Exception as exc:
+                logger.debug("Optional GitHub commit metadata check skipped: %s", exc)
+
+            # Compare strictly by release semver — never trigger on docs/Collab.md commits or downgrades
             if status.latest_version:
                 status.update_available = is_newer_version(status.latest_version, __version__)
             else:
                 status.update_available = False
-        except Exception as exc:
-            status.error = f"Update check failed: {exc}"
-            logger.debug("GitHub update check failed: %s", exc)
         finally:
             if owns_client:
                 client.close()

@@ -759,7 +759,7 @@ def test_t4_w6_release_update_check_non_downgrade_checksum_and_watchtower_workfl
         assert r_ok.status_code == 200
 
     # 4. Repo-level release readiness checks
-    assert gphotos_synology.__version__ == "1.2.0-0006"
+    assert gphotos_synology.__version__ == "1.2.0-0007"
     assert (REPO_ROOT / "uv.lock").is_file()
     workflow = (REPO_ROOT / ".github" / "workflows" / "docker-publish.yml").read_text(encoding="utf-8")
     assert "--locked" in workflow

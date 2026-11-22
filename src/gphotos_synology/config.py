@@ -123,6 +123,8 @@ class Settings(BaseSettings):
     exiftool_path: str = Field(default="exiftool")
     auto_index_existing_photos: bool = Field(default=True)
     index_workers: int = Field(default=2, ge=1, le=4)
+    index_throttle_cpu_pct: int = Field(default=90, ge=30, le=100)
+    index_yield_cpu_pct: int = Field(default=100, ge=40, le=100)
     dedup_mode: Literal["strict_hash", "exact_and_pixels", "perceptual"] = Field(
         default="perceptual"
     )
@@ -261,6 +263,8 @@ MUTABLE_UI_FIELDS: set[str] = {
     "write_album_tags",
     "auto_index_existing_photos",
     "index_workers",
+    "index_throttle_cpu_pct",
+    "index_yield_cpu_pct",
     "dedup_mode",
     "perceptual_max_distance",
     "duplicate_quality_policy",

@@ -219,7 +219,10 @@
       }
     }
     if (throttledEl) {
-      throttledEl.classList.toggle("hidden", !(state === "indexing_nas" && progress.index_throttled));
+      const isThrottled = state === "indexing_nas" && Boolean(progress.index_throttled);
+      const reason = progress.index_throttle_reason ? ` (${progress.index_throttle_reason})` : "";
+      throttledEl.textContent = `Throttled${reason}`;
+      throttledEl.classList.toggle("hidden", !isThrottled);
     }
 
     // Renewal banner
@@ -600,23 +603,54 @@
   });
 
   let currentBuildSha = "";
+  let latestAvailableVersion = "";
+  const DISMISSED_UPDATE_KEY = "gphotos_dismissed_update_version";
 
   function renderUpdateStatus(u, notifyIfCurrent = false) {
     currentBuildSha = u.current_sha || "";
-    const verLabel = `v${u.current_version}${u.current_sha ? ` · ${u.current_sha}` : ""}`;
+    const verLabel = `v${u.current_version}`;
     $("version-badge").textContent = verLabel;
 
     const banner = $("update-banner");
-    if (u.update_available) {
-      const msg = u.latest_commit_message ? ` — ${u.latest_commit_message}` : "";
+    const targetVersion = u.latest_version || "";
+    const dismissedVer = window.localStorage.getItem(DISMISSED_UPDATE_KEY) || "";
+
+    if (u.update_available && targetVersion) {
+      latestAvailableVersion = targetVersion;
+      const isSpk = Boolean(u.is_spk_install || IS_CGI_PROXY || !u.auto_updater_configured);
+      const hint = isSpk
+        ? " — update in DSM Package Center or download the .spk."
+        : "";
       $("update-banner-text").textContent =
-        `${u.current_sha} → ${u.latest_sha}${msg}`;
-      $("link-download-spk").href = u.spk_download_url || u.release_url || "#";
+        `Installed ${u.current_version} → Available ${targetVersion}${hint}`;
+
+      const notesLink = $("link-release-notes");
+      if (notesLink) {
+        notesLink.href = u.release_url || "#";
+      }
+      const spkLink = $("link-download-spk");
+      if (spkLink) {
+        spkLink.href = u.spk_download_url || u.release_url || "#";
+      }
+
       const applyBtn = $("btn-apply-update");
-      applyBtn.textContent = u.auto_updater_configured ? "Update Now" : "Pull Latest in Container Manager";
-      applyBtn.disabled = !u.auto_updater_configured;
-      banner.classList.remove("hidden");
+      if (applyBtn) {
+        if (u.auto_updater_configured && !u.is_spk_install && !IS_CGI_PROXY) {
+          applyBtn.textContent = "Update Now";
+          applyBtn.disabled = false;
+          applyBtn.classList.remove("hidden");
+        } else {
+          applyBtn.classList.add("hidden");
+        }
+      }
+
+      if (!notifyIfCurrent && dismissedVer === targetVersion) {
+        banner.classList.add("hidden");
+      } else {
+        banner.classList.remove("hidden");
+      }
     } else {
+      latestAvailableVersion = "";
       banner.classList.add("hidden");
       if (notifyIfCurrent) {
         if (u.error) {
@@ -628,7 +662,20 @@
     }
   }
 
+  const dismissUpdateBtn = $("btn-dismiss-update");
+  if (dismissUpdateBtn) {
+    dismissUpdateBtn.addEventListener("click", () => {
+      if (latestAvailableVersion) {
+        window.localStorage.setItem(DISMISSED_UPDATE_KEY, latestAvailableVersion);
+      }
+      $("update-banner").classList.add("hidden");
+    });
+  }
+
   async function checkUpdates(force = false) {
+    if (force) {
+      window.localStorage.removeItem(DISMISSED_UPDATE_KEY);
+    }
     try {
       const data = await apiFetch(`/api/updates?force=${force ? "true" : "false"}`);
       renderUpdateStatus(data, force);

@@ -54,15 +54,21 @@
       <div id="update-banner" class="banner banner-info hidden">
         <div>
           <strong>Update Available:</strong>
-          <span id="update-banner-text">A newer version is available on GitHub.</span>
+          <span id="update-banner-text">A newer release is available.</span>
         </div>
         <div class="inline-actions" style="margin-top:0">
-          <button id="btn-apply-update" class="btn btn-sm btn-primary" type="button">
+          <button id="btn-apply-update" class="btn btn-sm btn-primary hidden" type="button">
             Update Now
           </button>
-          <a id="link-download-spk" class="btn btn-sm btn-secondary" href="#" target="_blank" rel="noreferrer">
-            DSM App (.spk)
+          <a id="link-release-notes" class="btn btn-sm btn-secondary" href="#" target="_blank" rel="noreferrer">
+            Release Notes
           </a>
+          <a id="link-download-spk" class="btn btn-sm btn-primary" href="#" target="_blank" rel="noreferrer">
+            Download .spk
+          </a>
+          <button id="btn-dismiss-update" class="btn btn-sm btn-secondary" type="button">
+            Dismiss
+          </button>
         </div>
       </div>
 
@@ -426,7 +432,24 @@
                 <label for="index_workers">NAS Library Indexer Workers</label>
                 <input id="index_workers" name="index_workers" type="number" min="1" max="4" step="1" />
                 <small class="hint">
-                  Default 2 (capped at 4). Workers run at low CPU priority and automatically shed load when the NAS is busy.
+                  Default 2 (capped at 4). Workers run at low CPU priority (<code>nice +10</code>).
+                </small>
+              </div>
+              <div class="field">
+                <label for="index_throttle_cpu_pct">CPU Throttle Threshold (%)</label>
+                <input id="index_throttle_cpu_pct" name="index_throttle_cpu_pct" type="number" min="30" max="100" step="1" />
+                <small class="hint">
+                  Shed to 1 worker when system CPU (excluding disk I/O wait) reaches this % (default 90%).
+                </small>
+              </div>
+            </div>
+
+            <div class="row-2">
+              <div class="field">
+                <label for="index_yield_cpu_pct">CPU Hard-Yield Threshold (%)</label>
+                <input id="index_yield_cpu_pct" name="index_yield_cpu_pct" type="number" min="40" max="100" step="1" />
+                <small class="hint">
+                  Pause briefly between files when system CPU reaches this % (default 100%).
                 </small>
               </div>
               <div class="field"></div>

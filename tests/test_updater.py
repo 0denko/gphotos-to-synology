@@ -96,3 +96,59 @@ def test_watchtower_self_update_trigger() -> None:
     assert captured["method"] == "POST"
     assert captured["url"] == "http://updater:8080/v1/update?async=1"
     assert captured["auth"] == "Bearer secret-token"
+
+
+def test_update_checker_uses_release_version_not_git_commits() -> None:
+    """A newer docs/Collab.md commit on main must NOT trigger update_available when release == installed,
+    and /commits/main errors must not break release checks."""
+    from gphotos_synology import __version__
+
+    def same_release_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/releases/latest"):
+            return httpx.Response(
+                200,
+                json={
+                    "tag_name": f"v{__version__}",
+                    "html_url": f"https://github.com/0denko/gphotos-to-synology/releases/tag/v{__version__}",
+                    "assets": [],
+                },
+            )
+        if request.url.path.endswith("/commits/main"):
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "9999999999999999999999999999999999999999",
+                    "commit": {
+                        "message": "Collab.md: docs-only commit [skip ci]",
+                        "committer": {"date": "2026-11-22T14:00:00Z"},
+                    },
+                },
+            )
+        return httpx.Response(404)
+
+    settings = Settings(app_build_sha="1111111")
+    with httpx.Client(transport=httpx.MockTransport(same_release_handler)) as client:
+        res = UpdateService(cache_ttl_seconds=0).get_status(settings, force=True, http_client=client)
+    assert res["update_available"] is False
+    assert res["latest_version"] == __version__
+    assert res["error"] == ""
+
+    # Even if /commits/main returns 500, a genuinely newer release still reports update_available=True
+    def commits_down_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/releases/latest"):
+            return httpx.Response(
+                200,
+                json={
+                    "tag_name": "v9.9.9-0001",
+                    "html_url": "https://github.com/0denko/gphotos-to-synology/releases/tag/v9.9.9-0001",
+                    "assets": [],
+                },
+            )
+        return httpx.Response(500)
+
+    with httpx.Client(transport=httpx.MockTransport(commits_down_handler)) as client:
+        res2 = UpdateService(cache_ttl_seconds=0).get_status(settings, force=True, http_client=client)
+    assert res2["update_available"] is True
+    assert res2["latest_version"] == "9.9.9-0001"
+    assert res2["error"] == ""
+

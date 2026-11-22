@@ -54,14 +54,31 @@ def _compute_fingerprint_worker(path: Path, compute_visual: bool) -> MediaFinger
     return compute_media_fingerprint(path, compute_visual=compute_visual)
 
 
-def _get_system_load_1m() -> float | None:
-    """Return 1-minute system load average if available on this platform."""
-    if hasattr(os, "getloadavg"):
-        try:
-            return float(os.getloadavg()[0])
-        except OSError:
-            return None
-    return None
+def _read_proc_stat_cpu() -> tuple[int, int] | None:
+    """Return `(busy_ticks, total_ticks)` from Linux `/proc/stat`, excluding disk iowait from busy.
+
+    `/proc/stat` `cpu` fields: user, nice, system, idle, iowait, irq, softirq, steal, ...
+    Counting `iowait` as non-CPU-busy ensures disk-bound NAS activity (like Synology Photos
+    indexing) does not falsely trigger CPU throttling.
+    """
+    try:
+        with open("/proc/stat", encoding="utf-8") as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    if not first.startswith("cpu "):
+        return None
+    parts = first.split()[1:]
+    if len(parts) < 5:
+        return None
+    try:
+        vals = [int(x) for x in parts[:8]]
+    except ValueError:
+        return None
+    idle_and_iowait = vals[3] + vals[4]
+    total = sum(vals)
+    busy = max(0, total - idle_and_iowait)
+    return busy, total
 
 
 @dataclass
@@ -87,43 +104,65 @@ class ExistingLibraryScanner:
     def __init__(self, settings: Settings, db: StateDB) -> None:
         self.settings = settings
         self.db = db
+        self._prev_cpu_sample: tuple[int, int] | None = None
 
     def _effective_max_workers(self) -> int:
         configured = getattr(self.settings, "index_workers", 2)
         return max(1, min(int(configured), MAX_INDEX_WORKERS))
 
+    def _sample_system_cpu_pct(self) -> float | None:
+        """Return system-wide CPU busy percentage (0..100, excluding disk iowait) since last sample."""
+        cur = _read_proc_stat_cpu()
+        if cur is None:
+            return None
+        prev = self._prev_cpu_sample
+        self._prev_cpu_sample = cur
+        if prev is None:
+            return None
+        d_total = cur[1] - prev[1]
+        if d_total <= 0:
+            return None
+        d_busy = max(0, cur[0] - prev[0])
+        return min(100.0, max(0.0, (d_busy / d_total) * 100.0))
+
     def _compute_active_limit(
         self,
         max_workers: int,
         current_limit: int,
-        cpu_count: int,
-    ) -> tuple[int, float]:
-        """Load-aware politeness throttle: shed concurrency to 1 worker when NAS load is high.
+        *,
+        cpu_pct: float | None = None,
+    ) -> tuple[int, float, str]:
+        """CPU-based politeness throttle: shed concurrency only when actual CPU load is high.
 
-        Returns `(active_worker_limit, optional_yield_sleep_seconds)`.
+        Disk I/O wait is excluded from CPU utilization so disk-bound NAS jobs do not
+        needlessly throttle the indexer.
+        Returns `(active_worker_limit, optional_yield_sleep_seconds, throttle_reason)`.
         """
         if max_workers <= 1:
-            return 1, 0.0
-        load1 = _get_system_load_1m()
-        if load1 is None:
-            return max_workers, 0.0
-        high_threshold = max(1.0, cpu_count * 0.70)
-        critical_threshold = max(1.5, cpu_count * 0.90)
-        recover_threshold = high_threshold * 0.85
+            return 1, 0.0, ""
+        measured = self._sample_system_cpu_pct() if cpu_pct is None else cpu_pct
+        if measured is None:
+            return max_workers, 0.0, ""
 
-        if load1 >= critical_threshold:
-            return 1, 0.05
-        if load1 >= high_threshold:
-            return 1, 0.0
-        if current_limit < max_workers and load1 >= recover_threshold:
-            return current_limit, 0.0
-        return max_workers, 0.0
+        throttle_pct = float(getattr(self.settings, "index_throttle_cpu_pct", 90))
+        yield_pct = float(getattr(self.settings, "index_yield_cpu_pct", 100))
+        if yield_pct < throttle_pct:
+            yield_pct = throttle_pct
+        recover_pct = throttle_pct * 0.85
+
+        if measured >= yield_pct:
+            return 1, 0.05, f"CPU {round(measured)}%"
+        if measured >= throttle_pct:
+            return 1, 0.0, f"CPU {round(measured)}%"
+        if current_limit < max_workers and measured >= recover_pct:
+            return current_limit, 0.0, f"CPU {round(measured)}%"
+        return max_workers, 0.0, ""
 
     def scan(
         self,
         *,
         on_progress: Callable[[int, int], None] | None = None,
-        on_telemetry: Callable[[int, int, bool], None] | None = None,
+        on_telemetry: Callable[[int, int, bool, str], None] | None = None,
     ) -> LibraryScanResult:
         """Incrementally index all existing media files under PHOTOS_DIR.
 
@@ -160,15 +199,17 @@ class ExistingLibraryScanner:
             return result
 
         max_workers = self._effective_max_workers()
-        cpu_count = os.cpu_count() or 1
         active_limit = max_workers
         yield_sleep = 0.0
-        last_load_check = 0.0
+        throttle_reason = ""
+        # Prime baseline /proc/stat CPU counters before indexing begins
+        self._prev_cpu_sample = _read_proc_stat_cpu()
+        last_load_check = time.monotonic()
         completed = 0
 
-        def _emit_telemetry(active: int, throttled: bool) -> None:
+        def _emit_telemetry(active: int, throttled: bool, reason: str) -> None:
             if on_telemetry is not None:
-                on_telemetry(active, max_workers, throttled)
+                on_telemetry(active, max_workers, throttled, reason)
 
         def _emit_progress() -> None:
             if on_progress and (completed % 25 == 0 or completed == total):
@@ -215,7 +256,7 @@ class ExistingLibraryScanner:
                     item = pending.pop(fut)
                     _commit_future(fut, item)
 
-        _emit_telemetry(active_limit, False)
+        _emit_telemetry(active_limit, False, "")
         try:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max_workers,
@@ -254,18 +295,20 @@ class ExistingLibraryScanner:
                         _emit_progress()
                         continue
 
-                    # Periodically refresh load-aware politeness throttle
+                    # Periodically refresh CPU-based politeness throttle
                     now = time.monotonic()
                     if max_workers > 1 and (now - last_load_check) >= _LOAD_CHECK_INTERVAL_SECONDS:
-                        new_limit, new_sleep = self._compute_active_limit(
-                            max_workers, active_limit, cpu_count
+                        new_limit, new_sleep, new_reason = self._compute_active_limit(
+                            max_workers, active_limit
                         )
-                        if new_limit != active_limit or (new_sleep > 0) != (yield_sleep > 0):
-                            _emit_telemetry(
-                                new_limit,
-                                new_limit < max_workers or new_sleep > 0,
-                            )
-                        active_limit, yield_sleep = new_limit, new_sleep
+                        is_throttled = new_limit < max_workers or new_sleep > 0
+                        if (
+                            new_limit != active_limit
+                            or (new_sleep > 0) != (yield_sleep > 0)
+                            or new_reason != throttle_reason
+                        ):
+                            _emit_telemetry(new_limit, is_throttled, new_reason)
+                        active_limit, yield_sleep, throttle_reason = new_limit, new_sleep, new_reason
                         last_load_check = now
 
                     # Bound in-flight futures to active_limit so decoded images never pile up in RAM
@@ -284,7 +327,7 @@ class ExistingLibraryScanner:
                 # Drain all remaining in-flight work before pruning
                 _drain_some(0)
         finally:
-            _emit_telemetry(0, False)
+            _emit_telemetry(0, False, "")
 
         # Remove stale records for existing-NAS files that were deleted from disk
         result.pruned_missing = self.db.prune_missing_existing_nas_media(present_paths)

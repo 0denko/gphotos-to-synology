@@ -182,3 +182,73 @@ jobs:
             APP_BUILD_DATE=${{ steps.meta.outputs.created }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  publish-catalog:
+    needs: [build-standalone-spk]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Update Synology Package Source Catalogs (0denko/gphotos-synology-repo)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CATALOG_REPO_TOKEN: ${{ secrets.CATALOG_REPO_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          if [ -z "${CATALOG_REPO_TOKEN}" ]; then
+            echo "::notice::CATALOG_REPO_TOKEN secret is not configured; skipping automatic push to 0denko/gphotos-synology-repo."
+            exit 0
+          fi
+
+          mkdir -p /tmp/catalog-spks
+          gh release download "${RELEASE_TAG}" -R "${SOURCE_REPO}" -D /tmp/catalog-spks -p "*.spk" --clobber
+
+          git clone "https://x-access-token:${CATALOG_REPO_TOKEN}@github.com/0denko/gphotos-synology-repo.git" /tmp/catalog-repo
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          version = tag.lstrip("v")
+          source_repo = os.environ["SOURCE_REPO"]
+          repo_dir = Path("/tmp/catalog-repo")
+
+          for arch in ("x86_64", "arm64"):
+              spk_name = f"gphotos-migrator-dsm7-{arch}.spk"
+              spk_path = Path("/tmp/catalog-spks") / spk_name
+              if not spk_path.is_file():
+                  raise SystemExit(f"Missing expected SPK artifact: {spk_path}")
+              size = spk_path.stat().st_size
+              md5 = hashlib.md5(spk_path.read_bytes()).hexdigest()
+              link = f"https://github.com/{source_repo}/releases/download/{tag}/{spk_name}"
+
+              cat_path = repo_dir / f"packages-{arch}.json"
+              data = json.loads(cat_path.read_text(encoding="utf-8"))
+              entries = data.get("packages", data) if isinstance(data, dict) else data
+              updated = False
+              for entry in entries:
+                  if isinstance(entry, dict) and entry.get("package") == "gphotos-migrator":
+                      entry["version"] = version
+                      entry["link"] = link
+                      entry["md5"] = md5
+                      entry["size"] = int(size)
+                      updated = True
+              if not updated:
+                  raise SystemExit(f"No gphotos-migrator entry found in {cat_path}")
+              cat_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+              print(f"Updated {cat_path.name}: version={version} size={size} md5={md5}")
+          PY
+
+          cd /tmp/catalog-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "Catalog files already up to date."
+            exit 0
+          fi
+          git add packages-x86_64.json packages-arm64.json
+          git commit -m "Release ${RELEASE_TAG}: update x86_64 and arm64 SPK catalogs"
+          git push origin main
+

@@ -20,5 +20,15 @@
             "texts": "texts",
             "depend": []
         }
+    },
+    ".url": {
+        "SYNO.SDS.GPhotosMigrator.Mobile": {
+            "type": "url",
+            "allUsers": true,
+            "title": "Google Photos Migrator (Mobile)",
+            "desc": "Launch Google Photos Migrator with authenticated DSM session",
+            "icon": "images/icon_72.png",
+            "url": "/?launchApp=SYNO.SDS.GPhotosMigrator.Application"
+        }
     }
 }

@@ -1,3 +1,9 @@
 [app]
 app_name = "Google Photos Migrator"
 description = "Unattended Google Photos to Synology Photos background migration"
+
+[notification]
+update_ready_title = "Google Photos Migrator Update Ready"
+update_ready_msg = "A new verified version (%VERSION%) of Google Photos Migrator is staged and ready to install."
+update_check_failed_title = "Google Photos Migrator Update Check Failed"
+update_check_failed_msg = "Could not check for Google Photos Migrator updates. Please check network connectivity."

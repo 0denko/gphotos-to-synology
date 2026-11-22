@@ -266,13 +266,24 @@ def test_dsm73_cgi_scripts_are_python38_compatible() -> None:
         ast.parse(source, filename=str(path), feature_version=(3, 8))
 
 
-def test_ui_config_registers_single_clean_desktop_app_without_duplicate_url() -> None:
-    """Ensure ui/config registers a single clean DSM app entry (no duplicate .url menu icon)."""
+def test_ui_config_registers_desktop_app_mobile_deeplink_and_notify_strings() -> None:
+    """Ensure ui/config registers desktop app + mobile deep-link with concrete icon, and strings register notifications."""
     cfg = json.loads((UI_DIR / "config").read_text(encoding="utf-8"))
     desktop = cfg["GPhotosMigrator.js"]["SYNO.SDS.GPhotosMigrator.Application"]
     assert desktop["type"] == "app"
     assert desktop["allUsers"] is True
-    assert ".url" not in cfg
+
+    mobile = cfg[".url"]["SYNO.SDS.GPhotosMigrator.Mobile"]
+    assert mobile["type"] == "url"
+    assert mobile["allUsers"] is True
+    assert mobile["url"] == "/?launchApp=SYNO.SDS.GPhotosMigrator.Application"
+    assert mobile["icon"] == "images/icon_72.png"
+    assert "{0}" not in mobile["icon"]
+
+    strings_txt = (UI_DIR / "texts" / "enu" / "strings").read_text(encoding="utf-8")
+    assert "[notification]" in strings_txt
+    assert "update_ready_title" in strings_txt
+    assert "update_check_failed_title" in strings_txt
 
 
 def test_dsm73_webapi_validation_bridge_expiry_and_session_change(tmp_path: Path) -> None:

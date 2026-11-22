@@ -90,6 +90,7 @@ class PipelineProgress:
     active_index_workers: int = 0
     configured_index_workers: int = 0
     index_throttled: bool = False
+    index_throttle_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -284,10 +285,11 @@ class MigrationPipeline:
                 total_files=total,
                 current_step=f"Indexing existing NAS photos ({done}/{total})",
             ),
-            on_telemetry=lambda active, configured, throttled: self._set_progress(
+            on_telemetry=lambda active, configured, throttled, reason: self._set_progress(
                 active_index_workers=active,
                 configured_index_workers=configured,
                 index_throttled=throttled,
+                index_throttle_reason=reason,
             ),
         )
         if scan_res.newly_indexed > 0 or scan_res.pruned_missing > 0:

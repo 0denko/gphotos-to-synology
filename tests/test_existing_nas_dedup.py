@@ -271,12 +271,11 @@ def test_parallel_scanner_main_thread_writer_monotonic_progress_and_pre_dispatch
     assert res2.errors == 0
 
 
-def test_scanner_politeness_cap_and_load_aware_throttle(tmp_path: Path, monkeypatch) -> None:
-    """Verify index_workers defaults to 2, caps at 4, and sheds concurrency under high load."""
+def test_scanner_politeness_cap_and_cpu_throttle(tmp_path: Path) -> None:
+    """Verify index_workers defaults to 2 (cap 4), CPU throttle defaults to 90%/100%,
+    ignores disk iowait, reports triggering CPU% reason, and respects hysteresis."""
     import pytest
     from pydantic import ValidationError
-
-    from gphotos_synology.synology import scanner as scanner_mod
 
     default_settings = Settings(
         data_dir=tmp_path / "config",
@@ -285,6 +284,8 @@ def test_scanner_politeness_cap_and_load_aware_throttle(tmp_path: Path, monkeypa
         photos_dir=tmp_path / "photos",
     )
     assert default_settings.index_workers == 2
+    assert default_settings.index_throttle_cpu_pct == 90
+    assert default_settings.index_yield_cpu_pct == 100
 
     with pytest.raises(ValidationError):
         Settings(
@@ -299,25 +300,23 @@ def test_scanner_politeness_cap_and_load_aware_throttle(tmp_path: Path, monkeypa
     db = StateDB(default_settings.db_path)
     scanner = ExistingLibraryScanner(default_settings, db)
 
-    # Low load on 4-core NAS -> full configured 2 workers, no sleep
-    monkeypatch.setattr(scanner_mod, "_get_system_load_1m", lambda: 0.5)
-    assert scanner._compute_active_limit(2, 2, cpu_count=4) == (2, 0.0)
+    # Normal CPU (31%, even if disk IO wait is high!) -> full 2 workers, no throttle
+    assert scanner._compute_active_limit(2, 2, cpu_pct=31.0) == (2, 0.0, "")
 
-    # High load (>= 70% of 4 cores = 2.8) -> shed down to 1 worker
-    monkeypatch.setattr(scanner_mod, "_get_system_load_1m", lambda: 3.0)
-    assert scanner._compute_active_limit(2, 2, cpu_count=4) == (1, 0.0)
+    # Still below 90% threshold (85%) -> full 2 workers
+    assert scanner._compute_active_limit(2, 2, cpu_pct=85.0) == (2, 0.0, "")
 
-    # Critical load (>= 90% of 4 cores = 3.6) -> shed to 1 worker + brief yield sleep
-    monkeypatch.setattr(scanner_mod, "_get_system_load_1m", lambda: 4.0)
-    assert scanner._compute_active_limit(2, 1, cpu_count=4) == (1, 0.05)
+    # High CPU (>= 90%) -> shed down to 1 worker with reason
+    assert scanner._compute_active_limit(2, 2, cpu_pct=92.0) == (1, 0.0, "CPU 92%")
 
-    # Hysteresis: still above recover threshold (2.8 * 0.85 = 2.38) -> stay at 1
-    monkeypatch.setattr(scanner_mod, "_get_system_load_1m", lambda: 2.5)
-    assert scanner._compute_active_limit(2, 1, cpu_count=4) == (1, 0.0)
+    # Saturated CPU (>= 100%) -> shed to 1 worker + brief yield sleep
+    assert scanner._compute_active_limit(2, 1, cpu_pct=100.0) == (1, 0.05, "CPU 100%")
+
+    # Hysteresis: still above recover threshold (90 * 0.85 = 76.5%) -> stay at 1
+    assert scanner._compute_active_limit(2, 1, cpu_pct=80.0) == (1, 0.0, "CPU 80%")
 
     # Below recover threshold -> restore to 2 workers
-    monkeypatch.setattr(scanner_mod, "_get_system_load_1m", lambda: 1.5)
-    assert scanner._compute_active_limit(2, 1, cpu_count=4) == (2, 0.0)
+    assert scanner._compute_active_limit(2, 1, cpu_pct=65.0) == (2, 0.0, "")
 
 
 def test_pipeline_progress_rolling_rate_eta_cpu_and_worker_telemetry(
