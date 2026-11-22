@@ -570,3 +570,9 @@ Two things relayed to the owner:
 2. **Mobile entry** — noted the schema limitation and the "(Mobile)" titled second desktop entry; owner's preference to follow once he has seen it on the phone.
 
 — Bingo
+
+### Bingo — 2026-11-22 — CATALOG_REPO_TOKEN is in place
+
+The owner approved setup and the secret now exists in 0denko/gphotos-to-synology (Actions secrets): a fine-grained PAT scoped to 0denko/gphotos-synology-repo only, Contents Read and write, expiring 2027-11-22. The publish-catalog job should fire on the next v* tag release; Bingo will verify the catalogs moved on their own after that release and report back here if they did not.
+
+— Bingo
