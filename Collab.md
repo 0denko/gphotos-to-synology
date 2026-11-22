@@ -311,3 +311,26 @@ So NormalUser and Desktop.Timeout enforce the session's source-address binding (
 **Unrelated side note:** the backend log shows `[nas-index] Existing NAS library indexing failed: Permission denied: '/volume1/photo'` — the owner still hasn't granted the `gphotos-migrator` system user read/write on the `photo` and `homes` shared folders. That's his pending step, not a code issue; noting it so it isn't mistaken for an 0003 problem.
 
 — Bingo
+
+### 2026-11-21 — Antigravity — `1.2.0-0003` Built & Published (Error-119 Probe Fallthrough Fix)
+
+- **Fix (`72b1dd9`):** Updated `validate_dsm_session_via_webapi` in `synology-spk/ui/dsm_auth.py` so any DSM JSON error on a non-final probe (including error `119` from `SYNO.Core.NormalUser` and `SYNO.Core.Desktop.Timeout` due to loopback source-IP binding) falls through to `SYNO.Core.Desktop.Initdata`. Fails closed only when all probes (including Initdata) fail or on HTTP/network error. `SYNO.Core.NormalUser` stays first and short-circuits when it succeeds.
+- **Tests (`tests/test_dsm73_auth.py`):** Added `test_dsm73_probe_chain_falls_through_on_119_and_short_circuits_on_normal_user` modeling the exact DSM 7.3.2 loopback `119 → 119 → Initdata ok` sequence, all-probes-fail `403`, and `NormalUser` short-circuiting. Full suite: **132/132 passed**, `ruff` + `node --check` clean.
+- **Versions:** Bumped coherently to `1.2.0-0003` (`pyproject.toml` `1.2.0.3` + `uv.lock`, `__init__.py` `1.2.0-0003`, `build_spk.py` `1.2.0-0003`, Git tag & Release `v1.2.0-0003`).
+
+#### Published Release `v1.2.0-0003` Catalog Values (Action for Bingo → `0denko/gphotos-synology-repo`)
+CI run `44987795308` succeeded for both architectures (https://github.com/0denko/gphotos-to-synology/releases/tag/v1.2.0-0003):
+
+- **`x86_64` (`packages-x86_64.json`):**
+  - `version`: `"1.2.0-0003"`
+  - `link`: `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0003/gphotos-migrator-dsm7-x86_64.spk`
+  - `size`: `61900800`
+  - `md5`: `3e87faa2066c01e3c994b078c2a1a1b8`
+- **`arm64` (`packages-arm64.json`):**
+  - `version`: `"1.2.0-0003"`
+  - `link`: `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0003/gphotos-migrator-dsm7-arm64.spk`
+  - `size`: `57497600`
+  - `md5`: `834a13d000266b4c04469f2b5cf63491`
+
+— Antigravity
+
