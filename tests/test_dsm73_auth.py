@@ -31,9 +31,16 @@ DSM_AUTH_PY = UI_DIR / "dsm_auth.py"
 class _MockDSMWebAPI:
     """In-process mock of DSM 7.3's /webapi/entry.cgi for testing cookie validation."""
 
-    def __init__(self, *, mode: str = "initdata_only", valid_cookies: set[str] | None = None) -> None:
-        self.mode = mode  # "normal_user" | "timeout_only" | "initdata_only"
+    def __init__(
+        self,
+        *,
+        mode: str = "initdata_only",
+        valid_cookies: set[str] | None = None,
+        session_user: str = "odanylch",
+    ) -> None:
+        self.mode = mode  # "normal_user" | "timeout_only" | "initdata_only" | "dsm73_loopback_119" | "dsm73_initdata_session_user"
         self.valid_cookies: set[str] = valid_cookies or {"_SSID=valid-ssid; id=valid-id-1"}
+        self.session_user = session_user
         self.calls: list[dict[str, Any]] = []
         self._server: socketserver.TCPServer | None = None
         self._thread: threading.Thread | None = None
@@ -75,6 +82,20 @@ class _MockDSMWebAPI:
                         payload = {"success": True, "data": {"Session": {"SynoToken": "tok"}}}
                     else:
                         # Real DSM 7.3.2 behavior: NormalUser & Timeout return 119 from loopback
+                        payload = {"success": False, "error": {"code": 119}}
+                elif parent.mode == "dsm73_initdata_session_user":
+                    if api == "SYNO.Core.Desktop.Initdata":
+                        payload = {
+                            "success": True,
+                            "data": {
+                                "Session": {
+                                    "SynoToken": "tok",
+                                    "user": parent.session_user,
+                                    "is_admin": True,
+                                }
+                            },
+                        }
+                    else:
                         payload = {"success": False, "error": {"code": 119}}
                 else:
                     # Simulate API not present -> triggers fallback probe
@@ -213,6 +234,21 @@ def test_dsm73_cgi_scripts_are_python38_compatible() -> None:
     for path in (DSM_AUTH_PY, PROXY_CGI, OAUTH_CGI):
         source = path.read_text(encoding="utf-8")
         ast.parse(source, filename=str(path), feature_version=(3, 8))
+
+
+def test_ui_config_registers_both_desktop_app_and_mobile_url() -> None:
+    """Ensure ui/config registers both desktop ExtJS app and mobile URL menu entry."""
+    cfg = json.loads((UI_DIR / "config").read_text(encoding="utf-8"))
+    desktop = cfg["GPhotosMigrator.js"]["SYNO.SDS.GPhotosMigrator.Application"]
+    assert desktop["type"] == "app"
+    assert desktop["allUsers"] is True
+
+    mobile = cfg[".url"]["SYNO.SDS.GPhotosMigrator.Mobile"]
+    assert mobile["type"] == "url"
+    assert mobile["allUsers"] is True
+    assert mobile["url"] == "/webman/3rdparty/gphotos-migrator/proxy.cgi"
+    assert mobile["title"] == desktop["title"]
+    assert mobile["icon"] == desktop["icon"]
 
 
 def test_dsm73_webapi_validation_bridge_expiry_and_session_change(tmp_path: Path) -> None:
@@ -555,4 +591,118 @@ def test_dsm73_probe_chain_falls_through_on_119_and_short_circuits_on_normal_use
             assert b"Google Photos" in body_nu
             assert [c["api"] for c in webapi.calls] == ["SYNO.Core.NormalUser"]
             _extract_bridge_cookie(hdrs_nu["set-cookie"])
+
+
+def test_dsm73_standalone_initdata_session_user_and_hint_mismatch(tmp_path: Path) -> None:
+    """Regression for v1.2.0-0004 standalone missing_user bug + hint override security fix:
+    1. 119 / 119 / Initdata(Session.user='odanylch') authenticates standalone with NO dsm_user hint
+       and mints a bridge cookie.
+    2. A mismatched ?dsm_user=<other> hint is rejected (fail closed) and mints NO bridge cookie,
+       preventing privilege escalation via ?dsm_user=<admin>.
+    3. A mismatched hint is also rejected when a valid bridge cookie is present."""
+    secret = "dsm73-standalone-secret"
+    bridge_dir = tmp_path / "sessions"
+    settings = Settings(
+        data_dir=tmp_path / "config",
+        work_dir=tmp_path / "work",
+        inbox_dir=tmp_path / "inbox",
+        photos_dir=tmp_path / "photos",
+        proxy_secret=secret,
+        min_free_disk_gb=0.1,
+    )
+    app = create_app(base_settings=settings, start_worker=False)
+    valid_cookie = "_SSID=phone-ssid; id=phone-session-id; did=phone-dev; stay_login=1"
+
+    with _LiveBackend(app) as backend:
+        # 1. Standalone admin session: Initdata returns data.Session.user = "odanylch", NO hint
+        with _MockDSMWebAPI(
+            mode="dsm73_initdata_session_user",
+            valid_cookies={"id=phone-session-id"},
+            session_user="odanylch",
+        ) as webapi:
+            st, hdrs, body = _exec_cgi(
+                PROXY_CGI,
+                backend_url=backend.url,
+                dsm_webapi_url=webapi.url,
+                bridge_dir=bridge_dir,
+                proxy_secret=secret,
+                query_string="",  # Standalone phone/bookmark access: NO dsm_user hint!
+                cookie=valid_cookie,
+                admin_users="odanylch,admin",
+            )
+            assert st == 200
+            assert b"Google Photos" in body
+            assert [c["api"] for c in webapi.calls] == [
+                "SYNO.Core.NormalUser",
+                "SYNO.Core.Desktop.Timeout",
+                "SYNO.Core.Desktop.Initdata",
+            ]
+            bridge_pair = _extract_bridge_cookie(hdrs["set-cookie"])
+
+            # Subsequent API call using the newly minted bridge cookie skips webapi
+            webapi.calls.clear()
+            st_api, _hdrs_api, body_api = _exec_cgi(
+                PROXY_CGI,
+                backend_url=backend.url,
+                dsm_webapi_url=webapi.url,
+                bridge_dir=bridge_dir,
+                proxy_secret=secret,
+                query_string="p=/api/status",
+                cookie=f"{valid_cookie}; {bridge_pair}",
+                admin_users="odanylch,admin",
+            )
+            assert st_api == 200
+            assert json.loads(body_api)["photos_dir_writable"] is True
+            assert len(webapi.calls) == 0
+
+            # Mismatched hint WITH valid bridge cookie -> 403 fail closed
+            st_bm, hdrs_bm, body_bm = _exec_cgi(
+                PROXY_CGI,
+                backend_url=backend.url,
+                dsm_webapi_url=webapi.url,
+                bridge_dir=bridge_dir,
+                proxy_secret=secret,
+                query_string="dsm_user=admin",
+                cookie=f"{valid_cookie}; {bridge_pair}",
+                admin_users="odanylch,admin",
+            )
+            assert st_bm == 403
+            assert "DSM User Identity Mismatch" in body_bm.decode("utf-8")
+            assert "set-cookie" not in hdrs_bm
+
+            # Mismatched hint WITHOUT bridge cookie -> 403 fail closed, no bridge minted
+            st_mm, hdrs_mm, body_mm = _exec_cgi(
+                PROXY_CGI,
+                backend_url=backend.url,
+                dsm_webapi_url=webapi.url,
+                bridge_dir=bridge_dir,
+                proxy_secret=secret,
+                query_string="dsm_user=admin",
+                cookie=valid_cookie,
+                admin_users="odanylch,admin",
+            )
+            assert st_mm == 403
+            assert "DSM User Identity Mismatch" in body_mm.decode("utf-8")
+            assert "set-cookie" not in hdrs_mm
+
+        # 2. Non-admin DSM session trying to escalate via ?dsm_user=admin -> 403 fail closed!
+        with _MockDSMWebAPI(
+            mode="dsm73_initdata_session_user",
+            valid_cookies={"id=guest-session-id"},
+            session_user="guestuser",
+        ) as webapi:
+            st_esc, hdrs_esc, body_esc = _exec_cgi(
+                PROXY_CGI,
+                backend_url=backend.url,
+                dsm_webapi_url=webapi.url,
+                bridge_dir=bridge_dir,
+                proxy_secret=secret,
+                query_string="dsm_user=admin",
+                cookie="_SSID=guest-ssid; id=guest-session-id",
+                admin_users="odanylch,admin",
+            )
+            assert st_esc == 403
+            assert "DSM User Identity Mismatch" in body_esc.decode("utf-8")
+            assert "set-cookie" not in hdrs_esc
+
 

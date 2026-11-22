@@ -137,6 +137,24 @@ def main():
                     json.dumps({"detail": msg}).encode("utf-8"),
                 )
             return
+        if auth_err == "user_mismatch":
+            msg = (
+                "The requested DSM username does not match your authenticated DSM session. "
+                "Please open Google Photos Migrator directly without overriding the user parameter."
+            )
+            if method == "GET" and target_path == "/":
+                dsm_auth.write_response(
+                    403,
+                    [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+                    render_auth_error_html("DSM User Identity Mismatch", msg),
+                )
+            else:
+                dsm_auth.write_response(
+                    403,
+                    [("Content-Type", "application/json; charset=utf-8")],
+                    json.dumps({"detail": msg}).encode("utf-8"),
+                )
+            return
         if auth_err == "not_admin":
             msg = "Administrator privileges are required to open Google Photos Migrator."
             if method == "GET" and target_path == "/":

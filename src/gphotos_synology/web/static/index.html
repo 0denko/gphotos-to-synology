@@ -146,7 +146,7 @@
               <span class="muted">Google Drive &amp; Local Inbox</span>
             </div>
             <div class="table-wrap">
-              <table>
+              <table class="responsive-table">
                 <thead>
                   <tr>
                     <th>Archive</th>
@@ -213,7 +213,7 @@
             </button>
           </div>
           <div class="table-wrap">
-            <table>
+            <table class="responsive-table">
               <thead>
                 <tr>
                   <th>Album Name</th>
@@ -414,6 +414,17 @@
               </div>
             </div>
 
+            <div class="row-2">
+              <div class="field">
+                <label for="index_workers">NAS Library Indexer Workers</label>
+                <input id="index_workers" name="index_workers" type="number" min="1" max="4" step="1" />
+                <small class="hint">
+                  Default 2 (capped at 4). Workers run at low CPU priority and automatically shed load when the NAS is busy.
+                </small>
+              </div>
+              <div class="field"></div>
+            </div>
+
             <label class="checkbox-row">
               <input id="auto_index_existing_photos" name="auto_index_existing_photos" type="checkbox" />
               <span>Auto-index existing Synology Photos before each migration run (prevents duplicating pre-existing NAS images)</span>
@@ -518,7 +529,7 @@
         </form>
 
         <div class="table-wrap" style="margin-top:16px">
-          <table>
+          <table class="responsive-table">
             <thead>
               <tr>
                 <th>Profile</th>

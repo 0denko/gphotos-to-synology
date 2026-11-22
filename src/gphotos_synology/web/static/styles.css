@@ -622,3 +622,278 @@ th {
   opacity: 0.5;
   cursor: default;
 }
+
+.table-wrap {
+  -webkit-overflow-scrolling: touch;
+}
+
+.log-item {
+  overflow-wrap: anywhere;
+}
+
+.log-item .log-meta {
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+@media (max-width: 700px) {
+  .shell {
+    padding: 12px 12px 36px;
+  }
+
+  .topbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+
+  .brand {
+    gap: 10px;
+  }
+
+  .brand-icon {
+    width: 38px;
+    height: 38px;
+    flex-shrink: 0;
+  }
+
+  .topbar h1 {
+    font-size: 1.15rem;
+  }
+
+  .subtitle {
+    font-size: 0.82rem;
+  }
+
+  .topbar-actions {
+    gap: 8px;
+  }
+
+  .topbar-actions .btn {
+    flex: 1 1 calc(50% - 8px);
+    text-align: center;
+  }
+
+  .user-bar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .user-bar-left,
+  .user-bar-right {
+    width: 100%;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .user-select {
+    width: 100%;
+    min-width: 0;
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  #profile-path-pill {
+    word-break: break-all;
+    justify-content: flex-start;
+  }
+
+  .tabs {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    flex-wrap: nowrap;
+    scrollbar-width: none;
+    margin-bottom: 14px;
+  }
+
+  .tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tab {
+    white-space: nowrap;
+    min-height: 44px;
+    padding: 10px 14px;
+    font-size: 0.92rem;
+  }
+
+  .card {
+    padding: 14px;
+    margin-bottom: 14px;
+  }
+
+  .card-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .meta-times {
+    align-items: flex-start;
+  }
+
+  .kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+
+  .kpi-value {
+    font-size: 1.45rem;
+  }
+
+  .kpi-label {
+    font-size: 0.75rem;
+  }
+
+  .kpi-sub {
+    font-size: 0.78rem;
+  }
+
+  .progress-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .inline-actions {
+    width: 100%;
+  }
+
+  .inline-actions .btn,
+  .inline-actions a.btn {
+    flex: 1 1 auto;
+    text-align: center;
+  }
+
+  .btn,
+  .btn-sm {
+    min-height: 44px;
+    padding: 10px 14px;
+    font-size: 0.9rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .user-chip {
+    min-height: 38px;
+    padding: 8px 14px;
+  }
+
+  .settings-grid,
+  .row-2 {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .field input,
+  .field select {
+    min-height: 44px;
+    font-size: 16px;
+    padding: 10px 12px;
+  }
+
+  .checkbox-row {
+    align-items: flex-start;
+    gap: 10px;
+    padding: 4px 0;
+  }
+
+  .checkbox-row input[type="checkbox"] {
+    width: 20px;
+    height: 20px;
+    margin-top: 2px;
+    flex-shrink: 0;
+  }
+
+  /* Responsive stacked cards for data tables on phones */
+  table.responsive-table thead {
+    display: none;
+  }
+
+  table.responsive-table,
+  table.responsive-table tbody,
+  table.responsive-table tr,
+  table.responsive-table td {
+    display: block;
+    width: 100%;
+  }
+
+  table.responsive-table tr {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+  }
+
+  table.responsive-table td {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    padding: 5px 0;
+    border-bottom: 1px solid rgba(36, 48, 71, 0.55);
+    text-align: right;
+    overflow-wrap: anywhere;
+  }
+
+  table.responsive-table td:last-child {
+    border-bottom: none;
+  }
+
+  table.responsive-table td::before {
+    content: attr(data-label);
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--muted);
+    text-align: left;
+    flex-shrink: 0;
+  }
+
+  table.responsive-table td[colspan] {
+    display: block;
+    text-align: center;
+    border-bottom: none;
+    padding: 10px 0;
+  }
+
+  table.responsive-table td[colspan]::before {
+    display: none;
+  }
+
+  .banner {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 12px;
+    font-size: 0.86rem;
+  }
+
+  .toast {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    max-width: none;
+  }
+
+  .modal-backdrop {
+    padding: 10px;
+  }
+
+  .modal-card {
+    padding: 14px;
+    max-height: 92vh;
+  }
+}
+
+@media (max-width: 400px) {
+  .kpi-grid {
+    grid-template-columns: 1fr;
+  }
+}
+

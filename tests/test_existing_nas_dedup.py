@@ -203,3 +203,119 @@ def test_perceptual_dedup_catches_storage_saver_recompression_without_false_posi
     assert stats["total_duplicates_skipped"] == 1  # Re-compressed VACATION_01 skipped!
     assert stats["total_media"] == 1  # Distinct VACATION_02 imported!
     assert (cfg.settings.photos_dir / "2024/07/VACATION_02.jpg").exists()
+
+
+def test_parallel_scanner_main_thread_writer_monotonic_progress_and_pre_dispatch_skip(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Verify parallel ExistingLibraryScanner:
+    - Computes fingerprints in worker threads while committing to SQLite strictly on the main thread
+    - Emits strictly monotonic progress callbacks ending at (total, total)
+    - Applies skip checks BEFORE dispatch so unchanged files never touch the executor
+    - Resumes cleanly without losing already-indexed rows."""
+    import threading
+
+    from gphotos_synology.synology import scanner as scanner_mod
+
+    settings = Settings(
+        data_dir=tmp_path / "config",
+        work_dir=tmp_path / "work",
+        inbox_dir=tmp_path / "inbox",
+        photos_dir=tmp_path / "photos",
+        dedup_mode="perceptual",
+        index_workers=2,
+    )
+    settings.ensure_directories()
+    db = StateDB(settings.db_path)
+
+    # Create 35 distinct images (unique SHA-256 per file)
+    photos_dir = settings.photos_dir / "2025" / "03"
+    photos_dir.mkdir(parents=True)
+    for i in range(35):
+        img = _make_sample_image(1 if i % 2 == 0 else 2)
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([2 + i, 2, 10 + i, 12], fill=(i * 7 % 255, 100, 200))
+        (photos_dir / f"IMG_{i:03d}.jpg").write_bytes(_image_bytes(img, "JPEG", quality=85))
+
+    main_tid = threading.get_ident()
+    writer_tids: set[int] = set()
+    orig_upsert = db.upsert_existing_nas_media
+
+    def _tracking_upsert(**kwargs):
+        writer_tids.add(threading.get_ident())
+        return orig_upsert(**kwargs)
+
+    monkeypatch.setattr(db, "upsert_existing_nas_media", _tracking_upsert)
+
+    progress_events: list[tuple[int, int]] = []
+    scanner = ExistingLibraryScanner(settings, db)
+    res = scanner.scan(on_progress=lambda d, t: progress_events.append((d, t)))
+
+    assert res.scanned == 35
+    assert res.newly_indexed == 35
+    assert res.unchanged_skipped == 0
+    assert res.errors == 0
+    assert writer_tids == {main_tid}  # Single-writer SQLite strictly on main thread
+    assert progress_events[-1] == (35, 35)
+    assert [d for d, _ in progress_events] == sorted(d for d, _ in progress_events)
+
+    # Second scan must skip ALL 35 files BEFORE dispatch (never call compute_media_fingerprint)
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("Unchanged file was dispatched to worker!")
+
+    monkeypatch.setattr(scanner_mod, "compute_media_fingerprint", _must_not_run)
+    res2 = scanner.scan()
+    assert res2.scanned == 35
+    assert res2.newly_indexed == 0
+    assert res2.unchanged_skipped == 35
+    assert res2.errors == 0
+
+
+def test_scanner_politeness_cap_and_load_aware_throttle(tmp_path: Path, monkeypatch) -> None:
+    """Verify index_workers defaults to 2, caps at 4, and sheds concurrency under high load."""
+    import pytest
+    from pydantic import ValidationError
+
+    from gphotos_synology.synology import scanner as scanner_mod
+
+    default_settings = Settings(
+        data_dir=tmp_path / "config",
+        work_dir=tmp_path / "work",
+        inbox_dir=tmp_path / "inbox",
+        photos_dir=tmp_path / "photos",
+    )
+    assert default_settings.index_workers == 2
+
+    with pytest.raises(ValidationError):
+        Settings(
+            data_dir=tmp_path / "config",
+            work_dir=tmp_path / "work",
+            inbox_dir=tmp_path / "inbox",
+            photos_dir=tmp_path / "photos",
+            index_workers=8,
+        )
+
+    default_settings.ensure_directories()
+    db = StateDB(default_settings.db_path)
+    scanner = ExistingLibraryScanner(default_settings, db)
+
+    # Low load on 4-core NAS -> full configured 2 workers, no sleep
+    monkeypatch.setattr(scanner_mod, "_get_system_load_1m", lambda: 0.5)
+    assert scanner._compute_active_limit(2, 2, cpu_count=4) == (2, 0.0)
+
+    # High load (>= 70% of 4 cores = 2.8) -> shed down to 1 worker
+    monkeypatch.setattr(scanner_mod, "_get_system_load_1m", lambda: 3.0)
+    assert scanner._compute_active_limit(2, 2, cpu_count=4) == (1, 0.0)
+
+    # Critical load (>= 90% of 4 cores = 3.6) -> shed to 1 worker + brief yield sleep
+    monkeypatch.setattr(scanner_mod, "_get_system_load_1m", lambda: 4.0)
+    assert scanner._compute_active_limit(2, 1, cpu_count=4) == (1, 0.05)
+
+    # Hysteresis: still above recover threshold (2.8 * 0.85 = 2.38) -> stay at 1
+    monkeypatch.setattr(scanner_mod, "_get_system_load_1m", lambda: 2.5)
+    assert scanner._compute_active_limit(2, 1, cpu_count=4) == (1, 0.0)
+
+    # Below recover threshold -> restore to 2 workers
+    monkeypatch.setattr(scanner_mod, "_get_system_load_1m", lambda: 1.5)
+    assert scanner._compute_active_limit(2, 1, cpu_count=4) == (2, 0.0)
+

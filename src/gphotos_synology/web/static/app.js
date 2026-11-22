@@ -240,11 +240,11 @@
         const cls = a.status === "completed" ? "pill-ok" : a.status === "failed" ? "pill-err" : "pill-warn";
         return `
           <tr>
-            <td title="${escapeHtml(a.error_message || a.filename)}">${escapeHtml(a.filename)}</td>
-            <td>${escapeHtml(a.source)}</td>
-            <td><span class="pill ${cls}">${escapeHtml(a.status)}</span></td>
-            <td>${a.imported_files}</td>
-            <td>${a.duplicate_files}</td>
+            <td data-label="Archive" title="${escapeHtml(a.error_message || a.filename)}">${escapeHtml(a.filename)}</td>
+            <td data-label="Source">${escapeHtml(a.source)}</td>
+            <td data-label="Status"><span class="pill ${cls}">${escapeHtml(a.status)}</span></td>
+            <td data-label="Imported">${a.imported_files}</td>
+            <td data-label="Dups">${a.duplicate_files}</td>
           </tr>`;
       })
       .join("");
@@ -260,11 +260,11 @@
       .map(
         (al) => `
         <tr>
-          <td>${escapeHtml(al.name)}</td>
-          <td>${al.total_items}</td>
-          <td>${al.synced_items}</td>
-          <td>${al.pending_items}</td>
-          <td>${al.synology_album_id ?? '<span class="muted">--</span>'}</td>
+          <td data-label="Album">${escapeHtml(al.name)}</td>
+          <td data-label="Total">${al.total_items}</td>
+          <td data-label="Synced">${al.synced_items}</td>
+          <td data-label="Pending">${al.pending_items}</td>
+          <td data-label="Synology ID">${al.synology_album_id ?? '<span class="muted">--</span>'}</td>
         </tr>`
       )
       .join("");
@@ -646,16 +646,16 @@
           : `<button class="btn btn-sm btn-danger" type="button" data-del-profile="${escapeHtml(p.id)}">Remove</button>`;
         return `
         <tr>
-          <td><strong>${escapeHtml(p.display_name)}</strong></td>
-          <td><code>${escapeHtml(p.photos_dir)}</code></td>
-          <td>${(p.stats && p.stats.total_media) || 0}</td>
-          <td>
+          <td data-label="Profile"><strong>${escapeHtml(p.display_name)}</strong></td>
+          <td data-label="Destination"><code>${escapeHtml(p.photos_dir)}</code></td>
+          <td data-label="Migrated">${(p.stats && p.stats.total_media) || 0}</td>
+          <td data-label="Active">
             <button class="pill ${activeCls}" style="border:none;cursor:pointer" type="button"
               data-toggle-profile="${escapeHtml(p.id)}" data-enabled="${p.enabled ? "1" : "0"}">
               ${p.enabled ? "Enabled" : "Disabled"}
             </button>
           </td>
-          <td>${delBtn}</td>
+          <td data-label="Actions">${delBtn}</td>
         </tr>`;
       })
       .join("");

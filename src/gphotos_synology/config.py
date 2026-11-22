@@ -122,6 +122,7 @@ class Settings(BaseSettings):
     write_album_tags: bool = Field(default=True)
     exiftool_path: str = Field(default="exiftool")
     auto_index_existing_photos: bool = Field(default=True)
+    index_workers: int = Field(default=2, ge=1, le=4)
     dedup_mode: Literal["strict_hash", "exact_and_pixels", "perceptual"] = Field(
         default="perceptual"
     )
@@ -259,6 +260,7 @@ MUTABLE_UI_FIELDS: set[str] = {
     "write_exif_metadata",
     "write_album_tags",
     "auto_index_existing_photos",
+    "index_workers",
     "dedup_mode",
     "perceptual_max_distance",
     "duplicate_quality_policy",

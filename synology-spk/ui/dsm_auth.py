@@ -256,6 +256,14 @@ def validate_dsm_session_via_webapi(cookie_header):
                     if isinstance(cand, str) and is_valid_dsm_username(cand.strip()):
                         server_user = cand.strip()
                         break
+                if server_user is None:
+                    session_obj = data.get("Session")
+                    if isinstance(session_obj, dict):
+                        for key in ("user", "username", "account"):
+                            cand = session_obj.get(key)
+                            if isinstance(cand, str) and is_valid_dsm_username(cand.strip()):
+                                server_user = cand.strip()
+                                break
             return True, server_user
 
         # Any DSM error from a non-final probe (including 119 on NormalUser/Timeout due to
@@ -386,7 +394,7 @@ def authenticate_proxy_request(desktop_dsm_user, is_https):
     """Authenticate a `proxy.cgi` request.
 
     Returns `(username, is_admin, set_cookie_header_or_None, error_code_or_None)`.
-    `error_code` is one of: `None`, `"invalid_session"`, `"missing_user"`, `"not_admin"`.
+    `error_code` is one of: `None`, `"invalid_session"`, `"missing_user"`, `"user_mismatch"`, `"not_admin"`.
     """
     if is_skip_auth_test_mode():
         user = os.environ.get("GPHOTOS_TEST_DSM_USER", "admin").strip()
@@ -394,17 +402,23 @@ def authenticate_proxy_request(desktop_dsm_user, is_https):
             return None, False, None, "invalid_session"
         return user, is_dsm_admin(user), None, None
 
+    hint_user = (desktop_dsm_user or "").strip()
     cookie_header = os.environ.get("HTTP_COOKIE", "")
     bridge = load_valid_bridge(cookie_header)
     if bridge is not None:
         username, admin_flag = bridge
+        if hint_user and username.lower() != hint_user.lower():
+            return None, False, None, "user_mismatch"
         return username, admin_flag, None, None
 
     valid_session, server_user = validate_dsm_session_via_webapi(cookie_header)
     if not valid_session:
         return None, False, None, "invalid_session"
 
-    candidate_user = server_user or (desktop_dsm_user or "").strip()
+    if server_user and hint_user and server_user.lower() != hint_user.lower():
+        return None, False, None, "user_mismatch"
+
+    candidate_user = server_user or hint_user
     if not is_valid_dsm_username(candidate_user):
         return None, False, None, "missing_user"
 
