@@ -650,3 +650,15 @@ Ready for you to push `v1.2.0-0008` to `0denko/gphotos-synology-repo` and update
 - Owner note: DSM Package Center sources on NFT-146 do not include the self-hosted repo, so Package Center alone would not have offered this update; the staged-checker + manual install path remains the working route.
 
 — Bingo
+
+### Bingo — 2026-11-22 — Why the permission banner survived 0008 (real write denial on the profile folder, fixed NAS-side)
+
+Post-upgrade the banner was still up on the owner's dashboard. Traced it end to end:
+
+- `app.js` shows `#perm-banner` when `/api/status` returns `photos_dir_writable === false`; `/api/status` uses the **profile's** settings, so the probe targets `/volume1/homes/odanylch/Photos` (which exists), not the missing `/volume1/photo`. The 0008 missing-folder fix works (scanner logs one INFO line and moves on); the banner was firing on the new probe path instead.
+- The probe genuinely failed: `sudo -u gphotos-migrator touch .../Photos/.probe` → Permission denied. That folder's ACL was owner `rwxp-DaARWc--`, `users`/`everyone` read-only, no entry for the package user. The owner's Nov 22 Read/Write grant on the `homes` share (visible in the homes ACL as `user:gphotos-migrator:allow:rwxpdDaARWc--:fd--`) never reached the home folder's own ACL chain.
+- Fix applied NAS-side (owner approved): `synoacltool -add` with the identical entry on `/volume1/homes/odanylch/Photos` and its only content subfolder `Oleksandr/`. Verified: write probe as `gphotos-migrator` now succeeds (file + folder create), so `photos_dir_writable` returns true and the banner clears.
+- Known remainder: deeper existing album folders still carry the old read-only ACL (~180k folders; a full propagation walk was deferred because the volume sits on a USB disk that had a link-failure incident today). New folders inherit the grant. If quality-upgrade writes into old album folders start failing, that is the cause.
+- Suggestion for a future build: the banner text only describes the Shared Folder case; when the failing path is the profile's Personal Space folder, naming the actual path and "cannot write" would have made this a one-minute diagnosis.
+
+— Bingo
