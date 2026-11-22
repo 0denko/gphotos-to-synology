@@ -123,6 +123,7 @@ class ExistingLibraryScanner:
         self,
         *,
         on_progress: Callable[[int, int], None] | None = None,
+        on_telemetry: Callable[[int, int, bool], None] | None = None,
     ) -> LibraryScanResult:
         """Incrementally index all existing media files under PHOTOS_DIR.
 
@@ -164,6 +165,10 @@ class ExistingLibraryScanner:
         yield_sleep = 0.0
         last_load_check = 0.0
         completed = 0
+
+        def _emit_telemetry(active: int, throttled: bool) -> None:
+            if on_telemetry is not None:
+                on_telemetry(active, max_workers, throttled)
 
         def _emit_progress() -> None:
             if on_progress and (completed % 25 == 0 or completed == total):
@@ -210,66 +215,76 @@ class ExistingLibraryScanner:
                     item = pending.pop(fut)
                     _commit_future(fut, item)
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="nas-indexer",
-            initializer=_lower_worker_priority,
-        ) as pool:
-            for full_path, rel_posix in discovered:
-                present_paths.add(rel_posix)
-                result.scanned += 1
-                try:
-                    stat = full_path.stat()
-                except Exception as exc:
-                    result.errors += 1
-                    logger.warning("Failed indexing existing NAS file %s: %s", rel_posix, exc)
-                    completed += 1
-                    _emit_progress()
-                    continue
+        _emit_telemetry(active_limit, False)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="nas-indexer",
+                initializer=_lower_worker_priority,
+            ) as pool:
+                for full_path, rel_posix in discovered:
+                    present_paths.add(rel_posix)
+                    result.scanned += 1
+                    try:
+                        stat = full_path.stat()
+                    except Exception as exc:
+                        result.errors += 1
+                        logger.warning("Failed indexing existing NAS file %s: %s", rel_posix, exc)
+                        completed += 1
+                        _emit_progress()
+                        continue
 
-                # Pre-dispatch skip check on the main thread (never submits unchanged files)
-                existing_meta = indexed_by_path.get(rel_posix)
-                visual_stable = (
-                    existing_meta is not None
-                    and (
-                        existing_meta["has_visual"]
-                        or existing_meta.get("visual_status") == "undecodable"
+                    # Pre-dispatch skip check on the main thread (never submits unchanged files)
+                    existing_meta = indexed_by_path.get(rel_posix)
+                    visual_stable = (
+                        existing_meta is not None
+                        and (
+                            existing_meta["has_visual"]
+                            or existing_meta.get("visual_status") == "undecodable"
+                        )
                     )
-                )
-                if (
-                    existing_meta is not None
-                    and existing_meta["file_size"] == stat.st_size
-                    and existing_meta["file_mtime_ns"] == stat.st_mtime_ns
-                    and (not compute_visual or visual_stable or not self._is_image(full_path))
-                ):
-                    result.unchanged_skipped += 1
-                    completed += 1
-                    _emit_progress()
-                    continue
+                    if (
+                        existing_meta is not None
+                        and existing_meta["file_size"] == stat.st_size
+                        and existing_meta["file_mtime_ns"] == stat.st_mtime_ns
+                        and (not compute_visual or visual_stable or not self._is_image(full_path))
+                    ):
+                        result.unchanged_skipped += 1
+                        completed += 1
+                        _emit_progress()
+                        continue
 
-                # Periodically refresh load-aware politeness throttle
-                now = time.monotonic()
-                if max_workers > 1 and (now - last_load_check) >= _LOAD_CHECK_INTERVAL_SECONDS:
-                    active_limit, yield_sleep = self._compute_active_limit(
-                        max_workers, active_limit, cpu_count
+                    # Periodically refresh load-aware politeness throttle
+                    now = time.monotonic()
+                    if max_workers > 1 and (now - last_load_check) >= _LOAD_CHECK_INTERVAL_SECONDS:
+                        new_limit, new_sleep = self._compute_active_limit(
+                            max_workers, active_limit, cpu_count
+                        )
+                        if new_limit != active_limit or (new_sleep > 0) != (yield_sleep > 0):
+                            _emit_telemetry(
+                                new_limit,
+                                new_limit < max_workers or new_sleep > 0,
+                            )
+                        active_limit, yield_sleep = new_limit, new_sleep
+                        last_load_check = now
+
+                    # Bound in-flight futures to active_limit so decoded images never pile up in RAM
+                    _drain_some(max(0, active_limit - 1))
+                    if yield_sleep > 0:
+                        time.sleep(yield_sleep)
+
+                    fut = pool.submit(_compute_fingerprint_worker, full_path, compute_visual)
+                    pending[fut] = _PendingWorkItem(
+                        full_path=full_path,
+                        rel_posix=rel_posix,
+                        file_size=stat.st_size,
+                        file_mtime_ns=stat.st_mtime_ns,
                     )
-                    last_load_check = now
 
-                # Bound in-flight futures to active_limit so decoded images never pile up in RAM
-                _drain_some(max(0, active_limit - 1))
-                if yield_sleep > 0:
-                    time.sleep(yield_sleep)
-
-                fut = pool.submit(_compute_fingerprint_worker, full_path, compute_visual)
-                pending[fut] = _PendingWorkItem(
-                    full_path=full_path,
-                    rel_posix=rel_posix,
-                    file_size=stat.st_size,
-                    file_mtime_ns=stat.st_mtime_ns,
-                )
-
-            # Drain all remaining in-flight work before pruning
-            _drain_some(0)
+                # Drain all remaining in-flight work before pruning
+                _drain_some(0)
+        finally:
+            _emit_telemetry(0, False)
 
         # Remove stale records for existing-NAS files that were deleted from disk
         result.pruned_missing = self.db.prune_missing_existing_nas_media(present_paths)

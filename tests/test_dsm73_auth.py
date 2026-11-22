@@ -57,8 +57,17 @@ class _MockDSMWebAPI:
                 parsed = urllib.parse.urlsplit(self.path)
                 qs = urllib.parse.parse_qs(parsed.query)
                 api = (qs.get("api") or [""])[0]
+                syno_token_qs = (qs.get("SynoToken") or [""])[0]
+                syno_token_hdr = self.headers.get("X-SYNO-TOKEN", "")
                 cookie = self.headers.get("Cookie", "")
-                parent.calls.append({"api": api, "cookie": cookie})
+                parent.calls.append(
+                    {
+                        "api": api,
+                        "cookie": cookie,
+                        "syno_token_qs": syno_token_qs,
+                        "syno_token_hdr": syno_token_hdr,
+                    }
+                )
 
                 # Check if any known valid cookie token is present
                 is_valid = any(tok in cookie for tok in parent.valid_cookies)
@@ -95,6 +104,27 @@ class _MockDSMWebAPI:
                                 }
                             },
                         }
+                    else:
+                        payload = {"success": False, "error": {"code": 119}}
+                elif parent.mode == "dsm73_foreign_synotoken_gated":
+                    if api == "SYNO.Core.Desktop.Initdata":
+                        if syno_token_qs == "live-syno-token" and syno_token_hdr == "live-syno-token":
+                            payload = {
+                                "success": True,
+                                "data": {
+                                    "Session": {
+                                        "SynoToken": "live-syno-token",
+                                        "user": parent.session_user,
+                                        "is_admin": True,
+                                    }
+                                },
+                            }
+                        else:
+                            # Real DSM 7.3 foreign session without SynoToken: degraded payload
+                            payload = {
+                                "success": True,
+                                "data": {"Session": {"user": None, "is_admin": False}},
+                            }
                     else:
                         payload = {"success": False, "error": {"code": 119}}
                 else:
@@ -236,19 +266,13 @@ def test_dsm73_cgi_scripts_are_python38_compatible() -> None:
         ast.parse(source, filename=str(path), feature_version=(3, 8))
 
 
-def test_ui_config_registers_both_desktop_app_and_mobile_url() -> None:
-    """Ensure ui/config registers both desktop ExtJS app and mobile URL menu entry."""
+def test_ui_config_registers_single_clean_desktop_app_without_duplicate_url() -> None:
+    """Ensure ui/config registers a single clean DSM app entry (no duplicate .url menu icon)."""
     cfg = json.loads((UI_DIR / "config").read_text(encoding="utf-8"))
     desktop = cfg["GPhotosMigrator.js"]["SYNO.SDS.GPhotosMigrator.Application"]
     assert desktop["type"] == "app"
     assert desktop["allUsers"] is True
-
-    mobile = cfg[".url"]["SYNO.SDS.GPhotosMigrator.Mobile"]
-    assert mobile["type"] == "url"
-    assert mobile["allUsers"] is True
-    assert mobile["url"] == "/webman/3rdparty/gphotos-migrator/proxy.cgi"
-    assert mobile["title"] == desktop["title"]
-    assert mobile["icon"] == desktop["icon"]
+    assert ".url" not in cfg
 
 
 def test_dsm73_webapi_validation_bridge_expiry_and_session_change(tmp_path: Path) -> None:
@@ -704,5 +728,82 @@ def test_dsm73_standalone_initdata_session_user_and_hint_mismatch(tmp_path: Path
             assert st_esc == 403
             assert "DSM User Identity Mismatch" in body_esc.decode("utf-8")
             assert "set-cookie" not in hdrs_esc
+
+
+def test_dsm73_synotoken_upgrades_degraded_initdata_and_enforces_crosscheck(tmp_path: Path) -> None:
+    """Regression for foreign-session Initdata degradation:
+    - Without SynoToken, Initdata returns Session.user=None -> standalone fails closed (403 missing_user).
+    - With syno_token (forwarded by GPhotosMigrator.js), dsm_auth sends SynoToken + X-SYNO-TOKEN,
+      receives full Session.user, authenticates cleanly, mints bridge cookie, and rejects mismatched dsm_user."""
+    secret = "dsm73-synotoken-secret"
+    bridge_dir = tmp_path / "sessions"
+    settings = Settings(
+        data_dir=tmp_path / "config",
+        work_dir=tmp_path / "work",
+        inbox_dir=tmp_path / "inbox",
+        photos_dir=tmp_path / "photos",
+        proxy_secret=secret,
+        min_free_disk_gb=0.1,
+    )
+    app = create_app(base_settings=settings, start_worker=False)
+    valid_cookie = "_SSID=foreign-ssid; id=foreign-id; did=foreign-dev"
+
+    with (
+        _LiveBackend(app) as backend,
+        _MockDSMWebAPI(
+            mode="dsm73_foreign_synotoken_gated",
+            valid_cookies={"id=foreign-id"},
+            session_user="odanylch",
+        ) as webapi,
+    ):
+        # 1. No SynoToken & no hint -> degraded Initdata -> 403 missing_user (fail closed)
+        st_no_tok, hdrs_no_tok, body_no_tok = _exec_cgi(
+            PROXY_CGI,
+            backend_url=backend.url,
+            dsm_webapi_url=webapi.url,
+            bridge_dir=bridge_dir,
+            proxy_secret=secret,
+            query_string="",
+            cookie=valid_cookie,
+            admin_users="odanylch,admin",
+        )
+        assert st_no_tok == 403
+        assert "DSM User Identity Missing" in body_no_tok.decode("utf-8")
+        assert "set-cookie" not in hdrs_no_tok
+
+        # 2. With syno_token + mismatched dsm_user=admin -> full Session.user='odanylch' -> 403 mismatch!
+        webapi.calls.clear()
+        st_mm, hdrs_mm, body_mm = _exec_cgi(
+            PROXY_CGI,
+            backend_url=backend.url,
+            dsm_webapi_url=webapi.url,
+            bridge_dir=bridge_dir,
+            proxy_secret=secret,
+            query_string="dsm_user=admin&syno_token=live-syno-token",
+            cookie=valid_cookie,
+            admin_users="odanylch,admin",
+        )
+        assert st_mm == 403
+        assert "DSM User Identity Mismatch" in body_mm.decode("utf-8")
+        assert "set-cookie" not in hdrs_mm
+        assert all(c["syno_token_qs"] == "live-syno-token" for c in webapi.calls)
+        assert all(c["syno_token_hdr"] == "live-syno-token" for c in webapi.calls)
+
+        # 3. With syno_token + matching dsm_user=odanylch -> 200 + bridge cookie minted
+        webapi.calls.clear()
+        st_ok, hdrs_ok, body_ok = _exec_cgi(
+            PROXY_CGI,
+            backend_url=backend.url,
+            dsm_webapi_url=webapi.url,
+            bridge_dir=bridge_dir,
+            proxy_secret=secret,
+            query_string="dsm_user=odanylch&syno_token=live-syno-token",
+            cookie=valid_cookie,
+            admin_users="odanylch,admin",
+        )
+        assert st_ok == 200
+        assert b"Google Photos" in body_ok
+        _extract_bridge_cookie(hdrs_ok["set-cookie"])
+
 
 

@@ -22,28 +22,52 @@ Ext.define("SYNO.SDS.GPhotosMigrator.AppWindow", {
 
     PROXY_URL: "/webman/3rdparty/gphotos-migrator/proxy.cgi",
 
-    _resolveDsmUser: function () {
+    _resolveDsmSession: function () {
         try {
             var sess = (window.SYNO && SYNO.SDS && SYNO.SDS.Session) || null;
             if (!sess && window.parent && window.parent.SYNO && window.parent.SYNO.SDS) {
                 sess = window.parent.SYNO.SDS.Session;
             }
-            if (sess) {
-                var candidate = sess.user || sess.account || sess.username || "";
-                if (typeof candidate === "string" && candidate.trim()) {
-                    return candidate.trim();
-                }
-            }
+            return sess || null;
         } catch (e) {
-            // Fail closed: server will reject missing username if no bridge cookie exists
+            return null;
+        }
+    },
+
+    _resolveDsmUser: function () {
+        var sess = this._resolveDsmSession();
+        if (sess) {
+            var candidate = sess.user || sess.account || sess.username || "";
+            if (typeof candidate === "string" && candidate.trim()) {
+                return candidate.trim();
+            }
+        }
+        return "";
+    },
+
+    _resolveSynoToken: function () {
+        var sess = this._resolveDsmSession();
+        if (sess) {
+            var token = sess.SynoToken || sess.synoToken || "";
+            if (typeof token === "string" && token.trim()) {
+                return token.trim();
+            }
         }
         return "";
     },
 
     _buildIframeUrl: function () {
+        var params = [];
         var user = this._resolveDsmUser();
         if (user) {
-            return this.PROXY_URL + "?dsm_user=" + encodeURIComponent(user);
+            params.push("dsm_user=" + encodeURIComponent(user));
+        }
+        var synoToken = this._resolveSynoToken();
+        if (synoToken) {
+            params.push("syno_token=" + encodeURIComponent(synoToken));
+        }
+        if (params.length > 0) {
+            return this.PROXY_URL + "?" + params.join("&");
         }
         return this.PROXY_URL;
     },

@@ -20,15 +20,5 @@
             "texts": "texts",
             "depend": []
         }
-    },
-    ".url": {
-        "SYNO.SDS.GPhotosMigrator.Mobile": {
-            "type": "url",
-            "allUsers": true,
-            "title": "Google Photos Migrator",
-            "desc": "Unattended Google Photos to Synology Photos migration dashboard",
-            "icon": "images/icon_{0}.png",
-            "url": "/webman/3rdparty/gphotos-migrator/proxy.cgi"
-        }
     }
 }

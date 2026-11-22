@@ -6,6 +6,8 @@ import contextlib
 import logging
 import os
 import threading
+import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -56,6 +58,15 @@ def _resolve_contained(base_dir: Path, rel_or_name: str) -> Path:
     return target
 
 
+_RATE_WINDOW_SECONDS = 120.0
+_CPU_SAMPLE_MIN_INTERVAL_SECONDS = 1.0
+
+
+def _process_cpu_seconds() -> float:
+    t = os.times()
+    return float(t.user + t.system)
+
+
 @dataclass
 class PipelineProgress:
     """Thread-safe snapshot of live background migration state."""
@@ -70,6 +81,15 @@ class PipelineProgress:
     next_run_at: str | None = None
     last_error: str = ""
     renewal_reminder_due: bool = False
+    # Live worker telemetry (rolling rate, ETA, CPU usage, indexer politeness)
+    items_per_min: float = 0.0
+    eta_seconds: int | None = None
+    worker_cpu_pct: float = 0.0
+    worker_cpu_cores: float = 0.0
+    cpu_count: int = 1
+    active_index_workers: int = 0
+    configured_index_workers: int = 0
+    index_throttled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -90,11 +110,71 @@ class MigrationPipeline:
         self._synology_client_factory = synology_client_factory or SynologyPhotosClient
         self._progress_lock = threading.Lock()
         self._op_lock = threading.RLock()
-        self._progress = PipelineProgress()
+        self._cpu_count = max(1, os.cpu_count() or 1)
+        self._progress = PipelineProgress(cpu_count=self._cpu_count)
+        self._rate_samples: deque[tuple[float, int]] = deque()
+        self._rate_phase_key: tuple[str, str] = ("idle", "")
+        self._last_cpu_wall = time.monotonic()
+        self._last_cpu_proc = _process_cpu_seconds()
         self._inbox_scanner = LocalInboxScanner(self.config_manager.settings)
+
+    def _sample_cpu_locked(self, now: float) -> None:
+        dt = now - self._last_cpu_wall
+        if dt < _CPU_SAMPLE_MIN_INTERVAL_SECONDS:
+            return
+        cur_proc = _process_cpu_seconds()
+        dcpu = max(0.0, cur_proc - self._last_cpu_proc)
+        cores = dcpu / dt
+        pct = min(100.0, max(0.0, (cores / self._cpu_count) * 100.0))
+        self._progress.worker_cpu_cores = round(cores, 2)
+        self._progress.worker_cpu_pct = round(pct, 1)
+        self._progress.cpu_count = self._cpu_count
+        self._last_cpu_wall = now
+        self._last_cpu_proc = cur_proc
+
+    def _update_rate_and_eta_locked(self, now: float) -> None:
+        phase_key = (self._progress.state, self._progress.current_archive)
+        processed = self._progress.processed_files
+        total = self._progress.total_files
+
+        if phase_key != self._rate_phase_key or (
+            self._rate_samples and processed < self._rate_samples[-1][1]
+        ):
+            self._rate_samples.clear()
+            self._rate_phase_key = phase_key
+            self._progress.items_per_min = 0.0
+            self._progress.eta_seconds = None
+
+        if self._progress.state not in {"indexing_nas", "importing"} or total <= 0:
+            self._progress.items_per_min = 0.0
+            self._progress.eta_seconds = None
+            return
+
+        if not self._rate_samples or self._rate_samples[-1][1] != processed:
+            self._rate_samples.append((now, processed))
+
+        cutoff = now - _RATE_WINDOW_SECONDS
+        while len(self._rate_samples) > 2 and self._rate_samples[1][0] <= cutoff:
+            self._rate_samples.popleft()
+
+        if len(self._rate_samples) >= 2:
+            t0, c0 = self._rate_samples[0]
+            t1, c1 = self._rate_samples[-1]
+            dt = t1 - t0
+            dc = c1 - c0
+            if dt >= 1.0 and dc > 0:
+                rate_per_sec = dc / dt
+                self._progress.items_per_min = round(rate_per_sec * 60.0, 1)
+                remaining = max(0, total - processed)
+                self._progress.eta_seconds = round(remaining / rate_per_sec) if remaining > 0 else 0
+                return
+
+        self._progress.items_per_min = 0.0
+        self._progress.eta_seconds = None
 
     def get_progress(self) -> dict[str, Any]:
         with self._progress_lock:
+            self._sample_cpu_locked(time.monotonic())
             return self._progress.to_dict()
 
     def _set_progress(self, **kwargs: Any) -> None:
@@ -102,6 +182,15 @@ class MigrationPipeline:
             for key, value in kwargs.items():
                 if hasattr(self._progress, key):
                     setattr(self._progress, key, value)
+            now = time.monotonic()
+            if (
+                "state" in kwargs
+                or "current_archive" in kwargs
+                or "processed_files" in kwargs
+                or "total_files" in kwargs
+            ):
+                self._update_rate_and_eta_locked(now)
+            self._sample_cpu_locked(now)
 
     def _log(self, level: str, component: str, message: str) -> None:
         log_fn = getattr(logger, level.lower(), logger.info)
@@ -194,7 +283,12 @@ class MigrationPipeline:
                 processed_files=done,
                 total_files=total,
                 current_step=f"Indexing existing NAS photos ({done}/{total})",
-            )
+            ),
+            on_telemetry=lambda active, configured, throttled: self._set_progress(
+                active_index_workers=active,
+                configured_index_workers=configured,
+                index_throttled=throttled,
+            ),
         )
         if scan_res.newly_indexed > 0 or scan_res.pruned_missing > 0:
             self._log(

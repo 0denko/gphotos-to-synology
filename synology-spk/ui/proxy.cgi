@@ -84,14 +84,20 @@ def _extract_target_path_and_query():
     pairs = urllib.parse.parse_qsl(raw_qs, keep_blank_values=True)
     target_path = None
     desktop_dsm_user = ""
+    syno_token = ""
     forwarded_pairs = []
     for k, v in pairs:
         if k == "p" and target_path is None:
             target_path = v
         elif k == "dsm_user" and not desktop_dsm_user:
             desktop_dsm_user = v
+        elif k in ("syno_token", "SynoToken") and not syno_token:
+            syno_token = v
         else:
             forwarded_pairs.append((k, v))
+
+    if not syno_token:
+        syno_token = os.environ.get("HTTP_X_SYNO_TOKEN", "").strip()
 
     if not target_path:
         target_path = path_info if path_info else "/"
@@ -103,11 +109,11 @@ def _extract_target_path_and_query():
         target_path = "/" + target_path
 
     forwarded_qs = urllib.parse.urlencode(forwarded_pairs, doseq=True)
-    return target_path, forwarded_qs, desktop_dsm_user
+    return target_path, forwarded_qs, desktop_dsm_user, syno_token
 
 
 def main():
-    target_path, forwarded_qs, desktop_dsm_user = _extract_target_path_and_query()
+    target_path, forwarded_qs, desktop_dsm_user, syno_token = _extract_target_path_and_query()
     method = os.environ.get("REQUEST_METHOD", "GET").upper()
 
     proto = "https" if os.environ.get("HTTPS", "").lower() in ("on", "1", "true") else "http"
@@ -116,7 +122,7 @@ def main():
     is_https = proto == "https"
 
     dsm_user, dsm_is_admin, set_cookie, auth_err = dsm_auth.authenticate_proxy_request(
-        desktop_dsm_user, is_https
+        desktop_dsm_user, is_https, syno_token=syno_token
     )
     if not dsm_user:
         if auth_err == "missing_user":

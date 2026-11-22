@@ -159,6 +159,69 @@
     $("progress-bar").style.width = `${Math.min(100, Math.max(0, pct))}%`;
     $("progress-detail").textContent = detail;
 
+    // Live worker telemetry (rolling rate, ETA, CPU load, active workers, throttle)
+    const rateEl = $("telemetry-rate");
+    const etaEl = $("telemetry-eta");
+    const cpuEl = $("telemetry-cpu");
+    const workersEl = $("telemetry-workers");
+    const throttledEl = $("telemetry-throttled");
+    const isItemPhase = (state === "indexing_nas" || state === "importing") && progress.total_files > 0;
+
+    if (rateEl) {
+      const ipm = Number(progress.items_per_min || 0);
+      if (isItemPhase && ipm > 0) {
+        rateEl.textContent = `${ipm >= 100 ? Math.round(ipm).toLocaleString() : ipm.toFixed(1)} items/min`;
+        rateEl.classList.remove("hidden");
+      } else {
+        rateEl.classList.add("hidden");
+      }
+    }
+    if (etaEl) {
+      const eta = progress.eta_seconds;
+      if (isItemPhase && eta !== null && eta !== undefined && Number.isFinite(Number(eta))) {
+        const secs = Math.max(0, Math.round(Number(eta)));
+        let label = "<1m";
+        if (secs < 60) {
+          label = `${secs}s`;
+        } else if (secs < 3600) {
+          const m = Math.floor(secs / 60);
+          const s = secs % 60;
+          label = s > 0 ? `${m}m ${s}s` : `${m}m`;
+        } else if (secs < 86400) {
+          const h = Math.floor(secs / 3600);
+          const m = Math.floor((secs % 3600) / 60);
+          label = m > 0 ? `${h}h ${m}m` : `${h}h`;
+        } else {
+          const d = Math.floor(secs / 86400);
+          const h = Math.floor((secs % 86400) / 3600);
+          label = h > 0 ? `${d}d ${h}h` : `${d}d`;
+        }
+        etaEl.textContent = `ETA: ${label}`;
+        etaEl.classList.remove("hidden");
+      } else {
+        etaEl.classList.add("hidden");
+      }
+    }
+    if (cpuEl) {
+      const cpuPct = Number(progress.worker_cpu_pct || 0);
+      const cpuCores = Number(progress.worker_cpu_cores || 0);
+      cpuEl.textContent = `CPU: ${cpuPct.toFixed(1)}% (${cpuCores.toFixed(2)} cores)`;
+      cpuEl.className = "pill " + (cpuPct >= 75 ? "pill-warn" : "pill-muted");
+    }
+    if (workersEl) {
+      const activeW = Number(progress.active_index_workers || 0);
+      const cfgW = Number(progress.configured_index_workers || 0);
+      if (state === "indexing_nas" && cfgW > 0) {
+        workersEl.textContent = `Workers: ${activeW}/${cfgW}`;
+        workersEl.classList.remove("hidden");
+      } else {
+        workersEl.classList.add("hidden");
+      }
+    }
+    if (throttledEl) {
+      throttledEl.classList.toggle("hidden", !(state === "indexing_nas" && progress.index_throttled));
+    }
+
     // Renewal banner
     $("renewal-banner").classList.toggle("hidden", !progress.renewal_reminder_due);
 

@@ -319,3 +319,65 @@ def test_scanner_politeness_cap_and_load_aware_throttle(tmp_path: Path, monkeypa
     monkeypatch.setattr(scanner_mod, "_get_system_load_1m", lambda: 1.5)
     assert scanner._compute_active_limit(2, 1, cpu_count=4) == (2, 0.0)
 
+
+def test_pipeline_progress_rolling_rate_eta_cpu_and_worker_telemetry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Verify rolling 120s scan rate, ETA, CPU%, and worker/throttle telemetry in MigrationPipeline."""
+    from gphotos_synology.worker import pipeline as pipeline_mod
+
+    settings = Settings(
+        data_dir=tmp_path / "config",
+        work_dir=tmp_path / "work",
+        inbox_dir=tmp_path / "inbox",
+        photos_dir=tmp_path / "photos",
+    )
+    cfg = ConfigManager(settings)
+    db = StateDB(cfg.settings.db_path)
+
+    clock = [1000.0]
+    proc_cpu = [10.0]
+    monkeypatch.setattr(pipeline_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(pipeline_mod, "_process_cpu_seconds", lambda: proc_cpu[0])
+
+    pipe = MigrationPipeline(config_manager=cfg, db=db)
+    pipe._cpu_count = 4  # Simulate 4-core NAS
+
+    # Start indexing phase: 0/1000
+    pipe._set_progress(
+        state="indexing_nas",
+        processed_files=0,
+        total_files=1000,
+        active_index_workers=2,
+        configured_index_workers=2,
+        index_throttled=False,
+    )
+    # Fast initial skip burst: 500 items in 10s
+    clock[0] = 1010.0
+    proc_cpu[0] = 12.0
+    pipe._set_progress(processed_files=500, total_files=1000)
+
+    # Now slow fresh fingerprinting over the next 150s: 2 items/sec (120 items/min)
+    # Older fast-skip sample at t=1000 must drop out of the 120s rolling window!
+    for step in range(1, 6):
+        clock[0] = 1010.0 + step * 30.0
+        proc_cpu[0] += 18.0  # 0.6 cores over 30s -> 15.0% of 4 cores
+        pipe._set_progress(
+            processed_files=500 + step * 60,
+            total_files=1000,
+            active_index_workers=1,
+            configured_index_workers=2,
+            index_throttled=True,
+        )
+
+    prog = pipe.get_progress()
+    assert prog["items_per_min"] == 120.0
+    # Remaining = 1000 - 800 = 200 items at 2 items/sec -> ETA = 100s
+    assert prog["eta_seconds"] == 100
+    assert prog["worker_cpu_cores"] == 0.6
+    assert prog["worker_cpu_pct"] == 15.0
+    assert prog["active_index_workers"] == 1
+    assert prog["configured_index_workers"] == 2
+    assert prog["index_throttled"] is True
+
+

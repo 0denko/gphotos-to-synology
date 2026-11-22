@@ -202,10 +202,13 @@ def _loopback_ssl_context(url):
     return ssl.create_default_context()
 
 
-def validate_dsm_session_via_webapi(cookie_header):
+def validate_dsm_session_via_webapi(cookie_header, syno_token=None):
     """Validate browser DSM session cookies against DSM's local webapi.
 
     Returns `(is_valid: bool, server_username: str | None)`.
+    When `syno_token` is supplied (from `SYNO.SDS.Session.SynoToken`), it is sent as
+    both `SynoToken` query param and `X-SYNO-TOKEN` header so DSM's `Initdata` returns
+    the full `Session.user` identity even for foreign-IP sessions.
     Fails closed on missing cookies, HTTP/network errors, or DSM auth error codes.
     """
     if not cookie_header or not cookie_header.strip():
@@ -218,6 +221,12 @@ def validate_dsm_session_via_webapi(cookie_header):
         return False, None
     forward_cookie = "; ".join(dsm_pairs)
 
+    clean_token = None
+    if syno_token:
+        tok = sanitize_header_part(str(syno_token).strip())
+        if tok:
+            clean_token = tok
+
     base_url = get_dsm_webapi_url()
     ssl_ctx = _loopback_ssl_context(base_url)
     # Bypass any ambient HTTP_PROXY so loopback DSM webapi calls stay strictly local
@@ -227,15 +236,21 @@ def validate_dsm_session_via_webapi(cookie_header):
     )
 
     for api_name, version, method in _WEBAPI_PROBES:
-        qs = urllib.parse.urlencode({"api": api_name, "version": version, "method": method})
+        params = {"api": api_name, "version": version, "method": method}
+        if clean_token:
+            params["SynoToken"] = clean_token
+        qs = urllib.parse.urlencode(params)
         sep = "&" if "?" in base_url else "?"
         url = base_url + sep + qs
+        req_headers = {
+            "Cookie": forward_cookie,
+            "Accept": "application/json",
+        }
+        if clean_token:
+            req_headers["X-SYNO-TOKEN"] = clean_token
         req = urllib.request.Request(
             url,
-            headers={
-                "Cookie": forward_cookie,
-                "Accept": "application/json",
-            },
+            headers=req_headers,
             method="GET",
         )
         try:
@@ -390,7 +405,7 @@ def mint_bridge_cookie(username, dsm_fp, is_https):
     return "; ".join(attrs)
 
 
-def authenticate_proxy_request(desktop_dsm_user, is_https):
+def authenticate_proxy_request(desktop_dsm_user, is_https, syno_token=None):
     """Authenticate a `proxy.cgi` request.
 
     Returns `(username, is_admin, set_cookie_header_or_None, error_code_or_None)`.
@@ -411,7 +426,9 @@ def authenticate_proxy_request(desktop_dsm_user, is_https):
             return None, False, None, "user_mismatch"
         return username, admin_flag, None, None
 
-    valid_session, server_user = validate_dsm_session_via_webapi(cookie_header)
+    valid_session, server_user = validate_dsm_session_via_webapi(
+        cookie_header, syno_token=syno_token
+    )
     if not valid_session:
         return None, False, None, "invalid_session"
 

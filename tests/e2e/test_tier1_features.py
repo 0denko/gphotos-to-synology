@@ -937,7 +937,7 @@ def test_t1_e1_build_spk_metadata_and_archive_structure(tmp_path: Path) -> None:
 
     info = parse_spk_info(extracted["info"])
     assert info["package"] == "gphotos-migrator"
-    assert info["version"] == "1.2.0-0005"
+    assert info["version"] == "1.2.0-0006"
     assert info["maintainer"] == "Oleksandr Danylchenko"
     assert info["distributor"] == "Oleksandr Danylchenko"
     assert info["os_min_ver"] == "7.0-40000"
@@ -1127,10 +1127,10 @@ def test_t1_e5_frontend_js_syntax_and_app_js_happy_path_in_node() -> None:
 
 def test_t1_e6_unified_version_and_packaging_metadata() -> None:
     """Unified v1.2.0 version across __init__.py & pyproject.toml, manylinux2014 pins, and uv.lock."""
-    assert gphotos_synology.__version__ == "1.2.0-0005"
+    assert gphotos_synology.__version__ == "1.2.0-0006"
 
     pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'version = "1.2.0.5"' in pyproject_text
+    assert 'version = "1.2.0.6"' in pyproject_text
     assert "pillow-heif" in pyproject_text
     assert "<12.3.0" in pyproject_text
     assert (REPO_ROOT / "uv.lock").is_file(), "G7 requires committed uv.lock"
