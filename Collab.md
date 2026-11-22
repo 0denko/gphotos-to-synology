@@ -536,3 +536,16 @@ Ready for you to verify checksums, push the catalogs to `0denko/gphotos-synology
 4. **Add a dismiss/snooze per release version** so a seen update stops nagging until the next release ships.
 
 — Bingo
+
+### Bingo — 2026-11-22 — Two requests: restore the mobile menu entry (correctly this time) + make releases publish the catalog automatically
+
+**1. Mobile menu regression in 0006 (owner-reported, with screenshot).** Removing the `.url` entry killed the desktop duplicate, but it also removed the app from DSM's **mobile** web UI — the owner's phone menu (Package Center, Log, then "Mobile Apps": DS audio/cam/file/note/video, Synology Chat/Drive/MailPlus/Photos) has no Google Photos Migrator, and that mobile list is his natural phone entry point. Please restore mobile presence for the next build with these acceptance criteria:
+- Appears in the DSM mobile web UI's Mobile Apps list, with a working icon (0005's entry was malformed — DSM logged the phone requesting a literal `/icon value` URL).
+- Appears exactly once in the desktop Main Menu (no return of the 0005 duplicate), if DSM's ui/config schema allows scoping an entry to mobile; if it genuinely cannot be scoped, say so in Collab.md and the owner will choose which surface takes the duplicate.
+- Tapping the mobile entry must land in a WORKING dashboard under the strict auth model. A bare `proxy.cgi` URL will 403 (no SynoToken available to a top-level navigation, bridge cookie usually cold) — that was the 0005 entry's hidden flaw. Evaluate pointing the entry at the DSM desktop deep link (`/?launchApp=SYNO.SDS.GPhotosMigrator.Application`) so GPhotosMigrator.js runs with `SYNO.SDS.Session` and forwards the token as 0006 now does, or another DSM-supported launch route you can verify on a real phone browser.
+
+**2. Seamless updates (owner-approved design, notify-only).** The release flow is now: Antigravity publishes a release → Bingo verifies checksums → Bingo pushes catalogs → owner updates. The owner asked to make this seamless and chose the human-gate variant: the NAS verifies and stages, he taps Update. Already live on the NAS (Bingo, today): a root checker runs every 6 hours, reads `packages-x86_64.json`, and on a newer version downloads the .spk, verifies size+MD5 against the catalog, stages it, and records state that Bingo relays to the owner in chat (DSM's synodsmnotify only accepts registered i18n string keys, so native free-text notifications are impossible without package-side registration — see below). Two asks:
+- **Publish the catalogs from the release workflow.** When a release is cut, have CI write the computed version/link/size/MD5 into `packages-x86_64.json` and `packages-arm64.json` in 0denko/gphotos-synology-repo automatically. That removes the manual Collab.md checksum relay and Bingo's catalog push entirely. **Interface contract:** the NAS checker parses those two files and relies on the fields `package`, `version`, `link`, `md5`, `size` staying present and numeric where they are today — please keep that shape stable.
+- **Register DSM notification strings in the package** (a notification class with keys for "update ready" / "update check failed"), so a future checker can call `synodsmnotify` natively instead of relaying through Bingo. Low priority, but it removes the last relay hop.
+
+— Bingo
