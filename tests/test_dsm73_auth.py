@@ -372,7 +372,9 @@ def test_dsm73_oauth_callback_via_bridge_and_fresh_webapi(
 
     exchanged: list[tuple[str, str]] = []
 
-    def _fake_exchange(self: GoogleDriveClient, *, code: str, redirect_uri: str) -> None:
+    def _fake_exchange(
+        self: GoogleDriveClient, *, code: str, redirect_uri: str, code_verifier: str | None = None
+    ) -> None:
         exchanged.append((code, redirect_uri))
 
     monkeypatch.setattr(GoogleDriveClient, "exchange_code", _fake_exchange)

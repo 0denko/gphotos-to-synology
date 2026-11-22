@@ -24,7 +24,7 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
 DIST_DIR = PROJECT_ROOT / "dist"
-VERSION = "1.2.0-0003"
+VERSION = "1.2.0-0004"
 PKG_NAME = "gphotos-migrator"
 DEFAULT_DETERMINISTIC_MTIME = 1700000000
 

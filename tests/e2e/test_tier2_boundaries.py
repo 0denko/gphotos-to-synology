@@ -267,7 +267,9 @@ def test_t2_g3_oauth_callback_rejects_missing_unknown_spoofed_expired_replayed_s
 
     exchange_calls: list[tuple[str, str]] = []
 
-    def _fake_exchange(self: GoogleDriveClient, code: str, redirect_uri: str) -> None:
+    def _fake_exchange(
+        self: GoogleDriveClient, code: str, redirect_uri: str, code_verifier: str | None = None
+    ) -> None:
         exchange_calls.append((code, redirect_uri))
 
     monkeypatch.setattr(GoogleDriveClient, "exchange_code", _fake_exchange)

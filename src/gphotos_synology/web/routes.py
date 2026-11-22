@@ -485,8 +485,15 @@ def create_api_router() -> APIRouter:
         gdrive = GoogleDriveClient(pctx.config_manager.settings)
         redirect_uri = _resolve_redirect_uri(request, pctx)
 
-        # G3: Opaque server-side OAuth state token stored with TTL, profile_id, redirect_uri, and caller user
+        # G3 + PKCE: Generate authorization URL + PKCE code_verifier, then persist opaque one-time state
         state_token = secrets.token_urlsafe(32)
+        try:
+            auth_url, _, code_verifier = gdrive.build_authorization_url(
+                redirect_uri=redirect_uri, state=state_token
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         state_record = json.dumps(
             {
                 "state": state_token,
@@ -494,15 +501,11 @@ def create_api_router() -> APIRouter:
                 "redirect_uri": redirect_uri,
                 "dsm_user": identity.dsm_user,
                 "is_admin": identity.is_admin,
+                "code_verifier": code_verifier or "",
                 "created_at": time.time(),
             }
         )
         app_ctx.db.set_state(f"oauth_state:{state_token}", state_record)
-        try:
-            auth_url, _ = gdrive.build_authorization_url(redirect_uri=redirect_uri, state=state_token)
-        except Exception as exc:
-            app_ctx.db.delete_state(f"oauth_state:{state_token}")
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"authorization_url": auth_url, "redirect_uri": redirect_uri}
 
     @router.get("/oauth/google/callback")
@@ -535,6 +538,7 @@ def create_api_router() -> APIRouter:
             profile_id = str(rec.get("profile_id") or "")
             bound_redirect_uri = str(rec.get("redirect_uri") or "")
             bound_dsm_user = str(rec.get("dsm_user") or "")
+            bound_code_verifier = str(rec.get("code_verifier") or "") or None
             created_at = float(rec.get("created_at") or 0.0)
         except (ValueError, TypeError):
             app_ctx.db.delete_state(state_key)
@@ -592,7 +596,11 @@ def create_api_router() -> APIRouter:
         gdrive = GoogleDriveClient(pctx.config_manager.settings)
         redirect_uri = bound_redirect_uri or _resolve_redirect_uri(request, pctx)
         try:
-            gdrive.exchange_code(code=code, redirect_uri=redirect_uri)
+            gdrive.exchange_code(
+                code=code,
+                redirect_uri=redirect_uri,
+                code_verifier=bound_code_verifier,
+            )
             pctx.db.log_event("INFO", "oauth", f"Google Drive connected for '{pctx.profile.display_name}'")
             app_ctx.scheduler.trigger_now(profile_id=pctx.profile.id, albums_only=False)
             return RedirectResponse(url=f"{home_url}?profile={safe_pid}&oauth=success", status_code=302)

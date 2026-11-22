@@ -73,8 +73,10 @@ class GoogleDriveClient:
             }
         }
 
-    def build_authorization_url(self, redirect_uri: str, state: str | None = None) -> tuple[str, str]:
-        """Return (authorization_url, state) for initiating Google OAuth2 consent."""
+    def build_authorization_url(
+        self, redirect_uri: str, state: str | None = None
+    ) -> tuple[str, str, str | None]:
+        """Return (authorization_url, state, pkce_code_verifier) for initiating Google OAuth2 consent."""
         if not self.is_oauth_configured():
             raise ValueError("Google Client ID and Client Secret must be configured first.")
         flow = Flow.from_client_config(
@@ -88,18 +90,28 @@ class GoogleDriveClient:
             prompt="consent",
             state=state,
         )
-        return auth_url, returned_state
+        return auth_url, returned_state, flow.code_verifier
 
-    def exchange_code(self, code: str, redirect_uri: str) -> None:
-        """Exchange an OAuth2 authorization code for tokens and persist them."""
+    def exchange_code(
+        self,
+        code: str,
+        redirect_uri: str,
+        code_verifier: str | None = None,
+    ) -> None:
+        """Exchange an OAuth2 authorization code (with PKCE code_verifier) for tokens and persist them."""
         if not self.is_oauth_configured():
             raise ValueError("Google Client ID and Client Secret must be configured first.")
         flow = Flow.from_client_config(
             self._client_config(redirect_uri),
             scopes=self.scopes,
             redirect_uri=redirect_uri,
+            code_verifier=code_verifier,
+            autogenerate_code_verifier=False,
         )
-        flow.fetch_token(code=code)
+        fetch_kwargs: dict[str, Any] = {"code": code}
+        if code_verifier:
+            fetch_kwargs["code_verifier"] = code_verifier
+        flow.fetch_token(**fetch_kwargs)
         creds = flow.credentials
         self._save_credentials(creds)
 

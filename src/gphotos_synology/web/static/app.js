@@ -309,6 +309,37 @@
     }
   }
 
+  function isPrivateIpUrl(urlStr) {
+    try {
+      const host = (new URL(urlStr).hostname || "").replace(/^\[|\]$/g, "").toLowerCase();
+      if (!host) return false;
+      const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+      if (ipv4) {
+        const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
+        if (a === 10) return true;
+        if (a === 172 && b >= 16 && b <= 31) return true;
+        if (a === 192 && b === 168) return true;
+        if (a === 169 && b === 254) return true;
+        if (a === 100 && b >= 64 && b <= 127) return true;
+        return false;
+      }
+      if (host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:")) {
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  function updateRedirectUriWarning(defaultRedirectUri) {
+    const warnEl = $("redirect-uri-ip-warning");
+    if (!warnEl) return;
+    const input = $("google_redirect_uri");
+    const effective = (input && input.value.trim()) || defaultRedirectUri || "";
+    warnEl.classList.toggle("hidden", !isPrivateIpUrl(effective));
+  }
+
   async function loadSettings() {
     const defaultRedirectUri = IS_CGI_PROXY
       ? `${window.location.origin}${window.location.pathname.replace(/[^/]+$/, "oauth_callback.cgi")}`
@@ -325,6 +356,12 @@
         } else {
           el.value = val ?? "";
         }
+      }
+      updateRedirectUriWarning(defaultRedirectUri);
+      const redirectInput = $("google_redirect_uri");
+      if (redirectInput && !redirectInput.dataset.warnBound) {
+        redirectInput.dataset.warnBound = "1";
+        redirectInput.addEventListener("input", () => updateRedirectUriWarning(defaultRedirectUri));
       }
     } catch (err) {
       showToast(`Could not load settings: ${err.message}`, true);

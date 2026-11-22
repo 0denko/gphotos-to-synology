@@ -94,7 +94,8 @@ If you prefer running via Docker with Watchtower auto-updates:
 #### Option 1 — Built-in Google Drive OAuth2 (Recommended)
 1. In [Google Cloud Console](https://console.cloud.google.com/), create a project and enable the **Google Drive API**.
 2. Configure the **OAuth consent screen** (External → add your own Google account under **Test users**; no Google verification needed for personal use!).
-3. Create an **OAuth 2.0 Client ID** (Web application) and add the Authorized Redirect URI shown in the dashboard's **Settings & Connections** tab (e.g., `http://<YOUR_NAS_IP>:8765/api/oauth/google/callback`).
+3. Create an **OAuth 2.0 Client ID** (Web application) and add the Authorized Redirect URI shown in the dashboard's **Settings & Connections** tab.
+   - **Important:** Google requires a **domain name** for the redirect URI — open DSM via your **Synology QuickConnect** URL (e.g., `https://192-168-100-97.<your-id>.direct.quickconnect.to:5001/webman/3rdparty/gphotos-migrator/oauth_callback.cgi`) or a **DDNS domain** and connect from there. Private LAN IP URLs (such as `https://192.168.100.97:5001/...`) are hard-blocked by Google (`device_id and device_name are required for private IP`).
 4. Paste your Client ID & Client Secret in the dashboard, click **Connect Google Drive**, and authorize once. The refresh token is saved in `/data/config/google_token.json` for continuous unattended polling.
 
 > **Tip on Google Drive Storage Quota**: In **Settings → Google Drive Automation**, you can set **After Verified Import** to **Move Archive to Drive Trash** so processed Takeout ZIPs don't consume your Google One storage permanently.

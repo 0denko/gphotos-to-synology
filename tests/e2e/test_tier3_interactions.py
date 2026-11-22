@@ -162,7 +162,9 @@ def test_t3_p2_oauth_callback_cgi_with_real_fastapi_g3_c2(
 
     exchanged: list[tuple[str, str]] = []
 
-    def _fake_exchange(self: GoogleDriveClient, code: str, redirect_uri: str) -> None:
+    def _fake_exchange(
+        self: GoogleDriveClient, code: str, redirect_uri: str, code_verifier: str | None = None
+    ) -> None:
         exchanged.append((code, redirect_uri))
 
     monkeypatch.setattr(GoogleDriveClient, "exchange_code", _fake_exchange)

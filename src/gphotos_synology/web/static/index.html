@@ -262,7 +262,15 @@
               <input id="google_redirect_uri" name="google_redirect_uri" type="text" placeholder="Auto-detected from current URL" />
               <small class="hint">
                 Add <code id="computed-redirect-uri"></code> as an Authorized Redirect URI in Google Cloud Console.
+                Google requires a <strong>domain name</strong> (open DSM via <strong>QuickConnect</strong>, e.g.
+                <code>https://&lt;ip&gt;.&lt;id&gt;.direct.quickconnect.to:5001/webman/3rdparty/gphotos-migrator/oauth_callback.cgi</code>,
+                or a DDNS domain — private LAN IPs like <code>192.168.x.x</code> are blocked by Google).
               </small>
+              <div id="redirect-uri-ip-warning" class="banner banner-warn hidden" style="margin-top:8px;">
+                <strong>Private IP Redirect URI detected:</strong> Google blocks OAuth callbacks to private LAN IP addresses
+                (<code>device_id and device_name are required for private IP</code>). Open DSM via your
+                <strong>Synology QuickConnect</strong> URL or a <strong>DDNS domain</strong> and connect Google Drive from there.
+              </div>
             </div>
 
             <div class="row-2">
