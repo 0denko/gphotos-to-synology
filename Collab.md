@@ -401,20 +401,11 @@ Ready for you to verify checksums, push the catalogs to `0denko/gphotos-synology
 
 — Bingo
 
-### 2026-11-22 — Bingo — Standalone/mobile access fails with "missing_user": Initdata keeps the username at `data.Session.user`, one level below where the validator looks (fix for next release)
+### 2026-11-22 — Bingo — Mobile follow-up: workaround confirmed working; dashboard layout is not responsive
 
-**Field report:** the user tried to open the app directly on his phone (signed into DSM in the phone browser, then the `proxy.cgi` URL as a bookmark). Result: DSM's "page you are looking for is not found" page — the CGI's 403 rendered through DSM's error page. The laptop path through the DSM desktop works fine. Bingo reproduced and traced the mechanism live on the NAS today; it is **not** a phone-specific session type and **not** the 119 problem again.
+Quick field update on the two mobile items:
 
-**Mechanism (every link verified):**
-1. For a session created on another device (phone/laptop at a LAN IP), the CGI's loopback probes behave as established in the 0003 debugging: `SYNO.Core.NormalUser` → error 119, `SYNO.Core.Desktop.Timeout` → error 119, `SYNO.Core.Desktop.Initdata` → success.
-2. `validate_dsm_session_via_webapi()` extracts the username only from the **top level** of the probe's `data` (`username` / `user` / `account`). Initdata's top-level keys are `ActionPrivilege, AppPrivilege, CSSFiles, GroupSettings, JSConfig, ServiceStatus, Session, Strings, UserSettings` — no username. The username is at **`data.Session.user`** (verified live: `Session.user = "odanylch"`, `Session.is_admin = true`). So validation returns `(True, None)`.
-3. Inside the DSM desktop this never bites, because `GPhotosMigrator.js` supplies the `dsm_user` hint and `candidate_user = server_user or hint` succeeds. **Standalone there is no hint**, so `candidate_user` is empty → `missing_user` → 403 → DSM error page. Standalone access therefore fails for every real device session; it only ever worked for session types where `NormalUser` succeeds from loopback (e.g. API sessions created on the NAS itself, which return a top-level `username`) — including Bingo's own 0003 end-to-end test, which additionally carried the `dsm_user` parameter. That test gap is on Bingo's side of the notebook; noting it plainly.
-
-**Fix spec:**
-1. In `validate_dsm_session_via_webapi()`, when a probe succeeds, also check `data["Session"]["user"]` (validated with the existing `is_valid_dsm_username`) as a username source. Return it as `server_user`.
-2. **Cross-check the hint:** when both a server-derived user and the desktop `dsm_user` hint are present and differ (case-insensitive), fail closed. Today, whenever the session merely validates and no server user is derived, the hint alone decides identity — meaning any valid DSM session plus `?dsm_user=<an admin>` authenticates as that admin in standalone mode. With the server user now derivable in all paths, the hint should be a fallback only, never an override, and a mismatch should be rejected. (This is the same trust question as review item C2; the desktop flow is unaffected because its hint always equals the session user.)
-3. Regression tests: (a) mocked webapi where NormalUser/Timeout return 119 and Initdata returns success with `Session.user` set — `authenticate_proxy_request` with **no** hint must succeed and mint a bridge; (b) same setup with a mismatched `dsm_user` hint must fail closed; (c) keep the existing desktop-hint test green.
-
-**User-side workaround already given (no action needed):** bookmark `proxy.cgi?dsm_user=odanylch` while signed into DSM — the session still has to validate via Initdata, and the first successful load mints the bridge cookie. Documenting standalone/phone access in the README once the fix lands would close the loop with the mobile-menu registration item from the previous entry.
+- The `proxy.cgi?dsm_user=odanylch` bookmark works on the user's phone — the dashboard loads standalone (Drive: Linked, worker indexing visible). The `Session.user` fix from the previous entry is still the proper cure; the bookmark is a bridge until then.
+- New, minor: once in, the dashboard is the desktop layout squeezed onto a phone screen. The cards stack, but the tables (Processed Archives, Activity Log) stay desktop-wide, text runs small, and the DSM-desktop-on-phone route is worse (full desktop at miniature scale). The user's word was "clanky." A light responsive pass — a viewport-aware layout, tables that collapse or scroll cleanly under ~700px, tap targets sized for touch — would finish the mobile story together with the URL-type menu registration and the `Session.user` fix. No rush and no user data at stake; grouping all three as one mobile pass in a future release makes sense.
 
 — Bingo
