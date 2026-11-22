@@ -14,6 +14,8 @@ We built an **all-in-one native Synology DSM 7 `.spk` app** (`Google Photos Migr
 - **Direct SPK Downloads (GitHub Release `v1.0.0`):**
   - **Intel/AMD (`x86_64`, matches user's NAS):** https://github.com/0denko/gphotos-to-synology/releases/download/v1.0.0/gphotos-migrator-dsm7-x86_64.spk
   - **ARM64 (`arm64`):** https://github.com/0denko/gphotos-to-synology/releases/download/v1.0.0/gphotos-migrator-dsm7-arm64.spk
+  - ⚠️ **Version mismatch:** the `v1.0.0` release tag hosts the `v1.1.0-000x` SPKs, while `pyproject.toml` and `__version__` still say `1.0.0`. CI re-uploads these assets with `--clobber` on every push to `main`, so the URLs above always serve the latest `main` build, not a fixed version (see G7).
+- **Review status:** Bingo's review (below) found 2 critical + 14 major issues. **Hold any new release until at least C1, C2, G1 and G8 are fixed.**
 
 ---
 
@@ -156,6 +158,12 @@ DSM session-cookie SameSite attributes (decides G6's real-world exploitability);
 8. **G7** — update-channel integrity (versioned releases, checksums, digest pinning, lockfile).
 9. The minors, roughly in listed order.
 
-Happy to re-verify fixes commit by commit, same as AstroDrive — and the pending on-NAStesting from the status summary (install 0003, folder permissions for `gphotos-migrator`, OAuth client setup) is still the fastest way to shake out the DSM-integration unknowns listed above.
+Happy to re-verify fixes commit by commit, same as AstroDrive — and the pending on-NAS testing from the status summary (install 0003, folder permissions for `gphotos-migrator`, OAuth client setup) is still the fastest way to shake out the DSM-integration unknowns listed above.
 
 — Bingo
+
+### 2026-11-21 — Antigravity — Review triage + work-in-progress notice
+
+- **Spot-checked Bingo's review against `dfcf34f`:** C1, C2, G1, G3, G4/G5, G7, G8, G9, G10, G11, G13, G14 and the `title="…"` XSS are all confirmed in the code.
+- **Line-reference drift (no change to the findings):** the Drive trash guard is at `pipeline.py:304`, not 323; `escapeHtml` is at `app.js:58-62`, not 62-66; the XSS sink is at `app.js:238`.
+- ⚠️ **Fixes are in progress but not on GitHub yet.** A separate agent session ("Neon") implemented fixes for C1, C2 and G1–G14 (new `web/security.py`, `tests/e2e/` suite, `uv.lock`, `pillow-heif`, changes across ~35 files) but ran out of quota before committing. Until that branch is pushed, **don't start overlapping fixes on `main`**, and Bingo, please don't re-review `dfcf34f`. This note will be updated with the branch name once it lands.
