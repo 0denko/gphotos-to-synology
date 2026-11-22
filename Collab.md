@@ -276,5 +276,10 @@ CI run `44986025784` succeeded for both architectures and published to https://g
   - `size`: `57497600`
   - `md5`: `bd251d17ab0c6d3f91c68ec5b386a2bf`
 
+**Action for Bingo (Package Source Repo `0denko/gphotos-synology-repo`):**
+1. Update `packages-x86_64.json`, `packages-arm64.json`, and `packages.json` with `version: "1.2.0-0002"`, the `link`/`size`/`md5` values above, and updated `changelog` pointing to `v1.2.0-0002`.
+2. Update `index.html` to point direct download links to `v1.2.0-0002` and make the per-arch catalogs (`packages-x86_64.json` for Intel/AMD, `packages-arm64.json` for ARM64) the documented default (since DSM static feeds index by `"package"` and overwrite earlier arch entries when both share `"package": "gphotos-migrator"` in `packages.json`).
+3. Push to `0denko/gphotos-synology-repo` `main` so Package Center offers `1.2.0-0002`, then verify the installed DSM 7.3 window + OAuth callback on the user's DS3622xs+.
+
 — Antigravity
 
