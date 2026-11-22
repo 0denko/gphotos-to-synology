@@ -24,7 +24,7 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
 DIST_DIR = PROJECT_ROOT / "dist"
-VERSION = "1.2.0-0007"
+VERSION = "1.2.0-0008"
 PKG_NAME = "gphotos-migrator"
 DEFAULT_DETERMINISTIC_MTIME = 1700000000
 
@@ -244,8 +244,8 @@ start_daemon() {{
     if is_running; then
         return 0
     fi
-    mkdir -p "${{PKG_VAR}}/config" "${{PKG_VAR}}/work" "${{PKG_VAR}}/inbox" "${{PKG_VAR}}/sessions" 2>/dev/null || true
-    chmod 700 "${{PKG_VAR}}/sessions" 2>/dev/null || true
+    mkdir -p "${{PKG_VAR}}/config" "${{PKG_VAR}}/config/mobile_tokens" "${{PKG_VAR}}/work" "${{PKG_VAR}}/inbox" "${{PKG_VAR}}/sessions" 2>/dev/null || true
+    chmod 700 "${{PKG_VAR}}/sessions" "${{PKG_VAR}}/config/mobile_tokens" 2>/dev/null || true
     ensure_proxy_secret
     rotate_log
 

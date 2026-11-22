@@ -380,3 +380,36 @@ def test_pipeline_progress_rolling_rate_eta_cpu_and_worker_telemetry(
     assert prog["index_throttled"] is True
 
 
+def test_missing_photos_dir_is_normal_state_not_permission_error(tmp_path: Path) -> None:
+    """Missing Shared Space (/volume1/photo) must skip silently with no permission banner,
+    while an existing unwritable directory still returns is_photos_dir_writable() == False."""
+    import os
+
+    missing_photos = tmp_path / "nonexistent_shared_photo"
+    settings = Settings(
+        data_dir=tmp_path / "config",
+        work_dir=tmp_path / "work",
+        inbox_dir=tmp_path / "inbox",
+        photos_dir=missing_photos,
+    )
+    settings.ensure_directories()
+    assert not missing_photos.exists()
+    assert settings.is_photos_dir_writable() is True
+
+    db = StateDB(settings.db_path)
+    res = ExistingLibraryScanner(settings, db).scan()
+    assert res.scanned == 0
+    assert res.errors == 0
+    assert not missing_photos.exists()  # Must not try to create /volume1/photo
+
+    # When the folder EXISTS but is read-only (and we're non-root), permission check detects it
+    if os.geteuid() != 0:
+        missing_photos.mkdir()
+        os.chmod(missing_photos, 0o555)
+        try:
+            assert settings.is_photos_dir_writable() is False
+        finally:
+            os.chmod(missing_photos, 0o755)
+
+
+

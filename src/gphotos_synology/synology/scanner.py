@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 
 from gphotos_synology.config import Settings
 from gphotos_synology.database import StateDB
@@ -158,6 +159,8 @@ class ExistingLibraryScanner:
             return current_limit, 0.0, f"CPU {round(measured)}%"
         return max_workers, 0.0, ""
 
+    _missing_dir_logged: ClassVar[set[str]] = set()
+
     def scan(
         self,
         *,
@@ -172,9 +175,17 @@ class ExistingLibraryScanner:
         strictly on the main thread.
         """
         photos_dir = self.settings.photos_dir
-        photos_dir.mkdir(parents=True, exist_ok=True)
-
         result = LibraryScanResult()
+        if not photos_dir.is_dir():
+            key = str(photos_dir)
+            if key not in self._missing_dir_logged:
+                self._missing_dir_logged.add(key)
+                logger.info(
+                    "Photos directory %s does not exist (unused space); skipping scan.",
+                    photos_dir,
+                )
+            return result
+
         indexed_by_path = self.db.get_indexed_files_by_rel_path()
         compute_visual = self.settings.dedup_mode != "strict_hash"
 

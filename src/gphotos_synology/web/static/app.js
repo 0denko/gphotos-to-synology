@@ -915,9 +915,94 @@
     window.history.replaceState({}, "", BASE_PATH);
   }
 
+  async function loadMobileTokens() {
+    const tbody = $("mobile-tokens-tbody");
+    if (!tbody) return;
+    try {
+      const data = await apiFetch("/api/mobile-tokens");
+      const tokens = data.tokens || [];
+      if (!tokens.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="muted center">No personal mobile links generated.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = tokens
+        .map(
+          (t) => `
+          <tr>
+            <td data-label="Device"><strong>${escapeHtml(t.label)}</strong> <span class="muted">(${escapeHtml(t.id)})</span></td>
+            <td data-label="Created">${formatTime(t.created_at)}</td>
+            <td data-label="Last Used">${t.last_used_at ? formatTime(t.last_used_at) : '<span class="muted">Never</span>'}</td>
+            <td data-label="Action"><button class="btn btn-sm btn-danger" type="button" data-revoke-mobile-token="${escapeHtml(t.id)}">Revoke</button></td>
+          </tr>`
+        )
+        .join("");
+    } catch {
+      // Ignore if unauthenticated or unavailable
+    }
+  }
+
+  const createMobileTokenBtn = $("btn-create-mobile-token");
+  if (createMobileTokenBtn) {
+    createMobileTokenBtn.addEventListener("click", async () => {
+      const labelInput = $("mobile-token-label");
+      const label = (labelInput && labelInput.value.trim()) || "";
+      try {
+        const res = await apiFetch("/api/mobile-tokens", {
+          method: "POST",
+          body: JSON.stringify({ label }),
+        });
+        const baseUrl = IS_CGI_PROXY
+          ? `${window.location.origin}${window.location.pathname}`
+          : `${window.location.origin}${BASE_PATH}`;
+        const fullUrl = `${baseUrl}?token=${encodeURIComponent(res.token)}`;
+        const urlInput = $("mobile-token-url");
+        if (urlInput) urlInput.value = fullUrl;
+        const box = $("mobile-token-created");
+        if (box) box.classList.remove("hidden");
+        if (labelInput) labelInput.value = "";
+        showToast("Personal mobile access link generated — copy it now.");
+        await loadMobileTokens();
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+  }
+
+  const copyMobileTokenBtn = $("btn-copy-mobile-token");
+  if (copyMobileTokenBtn) {
+    copyMobileTokenBtn.addEventListener("click", async () => {
+      const urlInput = $("mobile-token-url");
+      if (!urlInput || !urlInput.value) return;
+      try {
+        await navigator.clipboard.writeText(urlInput.value);
+        showToast("Mobile link copied to clipboard.");
+      } catch {
+        urlInput.select();
+        document.execCommand("copy");
+        showToast("Mobile link copied.");
+      }
+    });
+  }
+
+  const mobileTokensTbody = $("mobile-tokens-tbody");
+  if (mobileTokensTbody) {
+    mobileTokensTbody.addEventListener("click", async (e) => {
+      const btn = e.target.closest("[data-revoke-mobile-token]");
+      if (!btn) return;
+      const id = btn.dataset.revokeMobileToken;
+      try {
+        await apiFetch(`/api/mobile-tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+        showToast("Mobile access link revoked.");
+        await loadMobileTokens();
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+  }
+
   (async () => {
     await loadProfiles(true);
-    await Promise.all([loadSettings(), refreshDashboard(), checkUpdates(false)]);
+    await Promise.all([loadSettings(), refreshDashboard(), checkUpdates(false), loadMobileTokens()]);
     setInterval(refreshDashboard, 4000);
     setInterval(() => checkUpdates(false), 30 * 60 * 1000);
   })();

@@ -266,19 +266,13 @@ def test_dsm73_cgi_scripts_are_python38_compatible() -> None:
         ast.parse(source, filename=str(path), feature_version=(3, 8))
 
 
-def test_ui_config_registers_desktop_app_mobile_deeplink_and_notify_strings() -> None:
-    """Ensure ui/config registers desktop app + mobile deep-link with concrete icon, and strings register notifications."""
+def test_ui_config_registers_single_desktop_app_and_notify_strings() -> None:
+    """Ensure ui/config registers a single clean DSM desktop app (no duplicate .url) and notification strings."""
     cfg = json.loads((UI_DIR / "config").read_text(encoding="utf-8"))
     desktop = cfg["GPhotosMigrator.js"]["SYNO.SDS.GPhotosMigrator.Application"]
     assert desktop["type"] == "app"
     assert desktop["allUsers"] is True
-
-    mobile = cfg[".url"]["SYNO.SDS.GPhotosMigrator.Mobile"]
-    assert mobile["type"] == "url"
-    assert mobile["allUsers"] is True
-    assert mobile["url"] == "/?launchApp=SYNO.SDS.GPhotosMigrator.Application"
-    assert mobile["icon"] == "images/icon_72.png"
-    assert "{0}" not in mobile["icon"]
+    assert ".url" not in cfg
 
     strings_txt = (UI_DIR / "texts" / "enu" / "strings").read_text(encoding="utf-8")
     assert "[notification]" in strings_txt
@@ -815,6 +809,180 @@ def test_dsm73_synotoken_upgrades_degraded_initdata_and_enforces_crosscheck(tmp_
         assert st_ok == 200
         assert b"Google Photos" in body_ok
         _extract_bridge_cookie(hdrs_ok["set-cookie"])
+
+
+def test_personal_mobile_access_link_create_use_cookie_and_revoke(tmp_path: Path) -> None:
+    """End-to-end test for opt-in revocable personal mobile access links:
+    1. Admin creates a token via POST /api/mobile-tokens.
+    2. Phone opens proxy.cgi?token=<raw> with NO DSM cookies -> 200 + HttpOnly gphotos_mobile_token cookie.
+    3. Follow-up API call using only gphotos_mobile_token cookie -> 200.
+    4. Mismatched ?dsm_user=admin -> 403 fail closed; invalid token -> 403 fail closed.
+    5. Revoking via DELETE /api/mobile-tokens/{id} immediately invalidates both URL and cookie."""
+    secret = "dsm73-mobile-token-secret"
+    bridge_dir = tmp_path / "sessions"
+    settings = Settings(
+        data_dir=tmp_path / "config",
+        work_dir=tmp_path / "work",
+        inbox_dir=tmp_path / "inbox",
+        photos_dir=tmp_path / "photos",
+        proxy_secret=secret,
+        min_free_disk_gb=0.1,
+    )
+    app = create_app(base_settings=settings, start_worker=False)
+    mobile_tokens_dir = str(settings.mobile_tokens_dir)
+    extra_env = {"GPHOTOS_MOBILE_TOKENS_DIR": mobile_tokens_dir}
+
+    with (
+        _LiveBackend(app) as backend,
+        _MockDSMWebAPI(
+            mode="dsm73_foreign_synotoken_gated",
+            valid_cookies={"id=admin-sess"},
+            session_user="odanylch",
+        ) as webapi,
+    ):
+        # Mint bridge via normal DSM session with SynoToken
+        st, hdrs, _ = _exec_cgi(
+            PROXY_CGI,
+            backend_url=backend.url,
+            dsm_webapi_url=webapi.url,
+            bridge_dir=bridge_dir,
+            proxy_secret=secret,
+            query_string="dsm_user=odanylch&syno_token=live-syno-token",
+            cookie="_SSID=s1; id=admin-sess",
+            admin_users="odanylch,admin",
+            extra_env=extra_env,
+        )
+        assert st == 200
+        bridge_pair = _extract_bridge_cookie(hdrs["set-cookie"])
+
+        # 1. Create personal mobile token via backend API
+        import urllib.request
+
+        req = urllib.request.Request(
+            f"{backend.url}/api/mobile-tokens",
+            data=json.dumps({"label": "iPhone"}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Proxy-Secret": secret,
+                "X-DSM-User": "odanylch",
+                "X-DSM-Admin": "1",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            created = json.loads(resp.read().decode("utf-8"))
+        raw_token = created["token"]
+        token_id = created["id"]
+        assert len(raw_token) >= 32
+        assert created["username"] == "odanylch"
+
+        # 2. Phone opens proxy.cgi?token=<raw_token> with ZERO DSM cookies!
+        st_mob, hdrs_mob, body_mob = _exec_cgi(
+            PROXY_CGI,
+            backend_url=backend.url,
+            dsm_webapi_url=webapi.url,
+            bridge_dir=bridge_dir,
+            proxy_secret=secret,
+            query_string=f"token={urllib.parse.quote(raw_token)}",
+            cookie="",
+            admin_users="odanylch,admin",
+            extra_env=extra_env,
+        )
+        assert st_mob == 200
+        assert b"Google Photos" in body_mob
+        set_cookie = hdrs_mob["set-cookie"]
+        assert "gphotos_mobile_token=" in set_cookie
+        assert "HttpOnly" in set_cookie
+        assert "Secure" in set_cookie
+        mobile_cookie_pair = set_cookie.split(";", 1)[0].strip()
+
+        # 3. Follow-up API call using ONLY gphotos_mobile_token cookie (no DSM cookies)
+        st_api, _hdrs_api, body_api = _exec_cgi(
+            PROXY_CGI,
+            backend_url=backend.url,
+            dsm_webapi_url=webapi.url,
+            bridge_dir=bridge_dir,
+            proxy_secret=secret,
+            query_string="p=/api/status",
+            cookie=mobile_cookie_pair,
+            admin_users="odanylch,admin",
+            extra_env=extra_env,
+        )
+        assert st_api == 200
+        assert json.loads(body_api)["photos_dir_writable"] is True
+
+        # 4. Mismatched dsm_user hint with mobile token -> 403 fail closed
+        st_mm, _hdrs_mm, _body_mm = _exec_cgi(
+            PROXY_CGI,
+            backend_url=backend.url,
+            dsm_webapi_url=webapi.url,
+            bridge_dir=bridge_dir,
+            proxy_secret=secret,
+            query_string=f"token={urllib.parse.quote(raw_token)}&dsm_user=admin",
+            cookie="",
+            admin_users="odanylch,admin",
+            extra_env=extra_env,
+        )
+        assert st_mm == 403
+
+        # Invalid/forged token -> 403 fail closed
+        st_bad, _hdrs_bad, body_bad = _exec_cgi(
+            PROXY_CGI,
+            backend_url=backend.url,
+            dsm_webapi_url=webapi.url,
+            bridge_dir=bridge_dir,
+            proxy_secret=secret,
+            query_string="token=" + "a" * 43,
+            cookie="",
+            admin_users="odanylch,admin",
+            extra_env=extra_env,
+        )
+        assert st_bad == 403
+        assert "Mobile Access Link Revoked" in body_bad.decode("utf-8")
+
+        # 5. Revoke token via DELETE /api/mobile-tokens/{id}
+        del_req = urllib.request.Request(
+            f"{backend.url}/api/mobile-tokens/{token_id}",
+            headers={
+                "X-Proxy-Secret": secret,
+                "X-DSM-User": "odanylch",
+                "X-DSM-Admin": "1",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            method="DELETE",
+        )
+        with urllib.request.urlopen(del_req, timeout=5) as resp:
+            assert json.loads(resp.read().decode("utf-8"))["ok"] is True
+
+        # Both ?token= URL and existing cookie must immediately fail closed (403)!
+        st_rev_url, _, _ = _exec_cgi(
+            PROXY_CGI,
+            backend_url=backend.url,
+            dsm_webapi_url=webapi.url,
+            bridge_dir=bridge_dir,
+            proxy_secret=secret,
+            query_string=f"token={urllib.parse.quote(raw_token)}",
+            cookie="",
+            admin_users="odanylch,admin",
+            extra_env=extra_env,
+        )
+        assert st_rev_url == 403
+
+        st_rev_cookie, _, _ = _exec_cgi(
+            PROXY_CGI,
+            backend_url=backend.url,
+            dsm_webapi_url=webapi.url,
+            bridge_dir=bridge_dir,
+            proxy_secret=secret,
+            query_string="p=/api/status",
+            cookie=mobile_cookie_pair,
+            admin_users="odanylch,admin",
+            extra_env=extra_env,
+        )
+        assert st_rev_cookie == 403
+        assert bridge_pair  # keep flake/unused quiet
+
 
 
 

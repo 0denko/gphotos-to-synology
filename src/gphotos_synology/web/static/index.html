@@ -509,6 +509,67 @@
               <button type="submit" class="btn btn-primary">Save All Settings</button>
             </div>
           </div>
+
+          <!-- Personal Mobile Access Link Card -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2>Personal Mobile Access Link</h2>
+                <p class="muted">
+                  Generate a private, revocable link to open this full-screen dashboard directly on your phone
+                  (e.g. Safari/Chrome → <strong>Add to Home Screen</strong>) without DSM desktop framing.
+                </p>
+              </div>
+            </div>
+
+            <div class="banner banner-warn" style="margin-bottom:12px;">
+              <div>
+                <strong>Treat this link like a password:</strong> anyone with the link can access the dashboard
+                as your DSM admin account. You can revoke any link below at any time.
+              </div>
+            </div>
+
+            <div class="row-2">
+              <div class="field">
+                <label for="mobile-token-label">Device Label (optional)</label>
+                <input id="mobile-token-label" type="text" maxlength="64" placeholder="e.g. My iPhone" />
+              </div>
+              <div class="field" style="display:flex;align-items:flex-end;">
+                <button id="btn-create-mobile-token" class="btn btn-primary" type="button" style="width:100%;">
+                  Generate Mobile Link
+                </button>
+              </div>
+            </div>
+
+            <div id="mobile-token-created" class="discovered-box hidden">
+              <div class="kpi-label" style="margin-bottom:6px">Copy Now (Shown Once)</div>
+              <div class="field" style="margin-bottom:8px;">
+                <input id="mobile-token-url" type="text" readonly />
+              </div>
+              <div class="inline-actions" style="margin-top:0">
+                <button id="btn-copy-mobile-token" class="btn btn-sm btn-primary" type="button">Copy Link</button>
+                <span class="hint" style="margin:0;">Open on your phone, then tap Share → Add to Home Screen.</span>
+              </div>
+            </div>
+
+            <div class="table-wrap" style="margin-top:12px">
+              <table class="responsive-table">
+                <thead>
+                  <tr>
+                    <th>Device</th>
+                    <th>Created</th>
+                    <th>Last Used</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="mobile-tokens-tbody">
+                  <tr>
+                    <td colspan="4" class="muted center">No personal mobile links generated.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </form>
       </section>
     </div>

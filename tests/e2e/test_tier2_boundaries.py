@@ -1039,6 +1039,7 @@ def test_t2_g14_personal_and_shared_subfolder_rejects_traversal_and_symlink_esca
     # Create symlink inside alice's Photos pointing to maria's Photos
     (alice_photos / "escape_link").symlink_to(maria_photos)
     # Create symlink inside shared photos_dir pointing outside
+    settings.photos_dir.mkdir(parents=True, exist_ok=True)
     outside = tmp_path / "outside_dir"
     outside.mkdir()
     (settings.photos_dir / "shared_escape").symlink_to(outside)

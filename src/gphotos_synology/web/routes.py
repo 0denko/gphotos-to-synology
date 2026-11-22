@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import hmac
 import io
 import json
+import os
 import secrets
 import time
 from typing import Any
@@ -39,6 +42,10 @@ class SettingsUpdateRequest(BaseModel):
 
 class AuthSessionRequest(BaseModel):
     token: str
+
+
+class MobileTokenCreateRequest(BaseModel):
+    label: str = ""
 
 
 def create_api_router() -> APIRouter:
@@ -617,5 +624,118 @@ def create_api_router() -> APIRouter:
         GoogleDriveClient(pctx.config_manager.settings).disconnect()
         pctx.db.log_event("INFO", "oauth", f"Disconnected Google Drive for '{pctx.profile.display_name}'")
         return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # Personal Mobile Access Links (opt-in, per-user, revocable)
+    # ------------------------------------------------------------------
+    def _mobile_tokens_dir(request: Request):
+        tokens_dir = _app_ctx(request).config_manager.settings.mobile_tokens_dir
+        tokens_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(tokens_dir, 0o700)
+        return tokens_dir
+
+    @router.get("/mobile-tokens")
+    def list_mobile_tokens(request: Request) -> dict[str, Any]:
+        identity = get_identity(request)
+        assert_admin(identity)
+        current_user = (identity.dsm_user or "").strip().lower()
+        tokens_dir = _mobile_tokens_dir(request)
+        items: list[dict[str, Any]] = []
+        for path in sorted(tokens_dir.glob("*.json")):
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            rec_user = str(rec.get("username") or "").strip()
+            if current_user and rec_user.lower() != current_user:
+                continue
+            items.append(
+                {
+                    "id": str(rec.get("id") or path.stem[:12]),
+                    "username": rec_user,
+                    "label": str(rec.get("label") or "Mobile Device"),
+                    "created_at": rec.get("created_at"),
+                    "last_used_at": rec.get("last_used_at"),
+                }
+            )
+        items.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+        return {"tokens": items}
+
+    @router.post("/mobile-tokens")
+    def create_mobile_token(request: Request, payload: MobileTokenCreateRequest) -> dict[str, Any]:
+        app_ctx = _app_ctx(request)
+        identity = get_identity(request)
+        assert_admin(identity)
+        username = (identity.dsm_user or "admin").strip()
+        label = (payload.label or "").strip()[:64] or "Mobile Device"
+
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        token_id = token_hash[:12]
+        created_at = utc_now_iso()
+
+        tokens_dir = _mobile_tokens_dir(request)
+        target_path = tokens_dir / f"{token_hash}.json"
+        tmp_path = tokens_dir / f".{token_hash}.tmp.{os.getpid()}"
+        record = {
+            "id": token_id,
+            "username": username,
+            "label": label,
+            "created_at": created_at,
+            "last_used_at": None,
+            "last_used_epoch": 0,
+        }
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(record, fh)
+            os.replace(tmp_path, target_path)
+        except Exception:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+            raise
+
+        app_ctx.db.log_event(
+            "INFO",
+            "auth",
+            f"Issued personal mobile access link '{label}' ({token_id}) for {username}",
+        )
+        return {
+            "ok": True,
+            "token": raw_token,
+            "id": token_id,
+            "username": username,
+            "label": label,
+            "created_at": created_at,
+        }
+
+    @router.delete("/mobile-tokens/{token_id}")
+    def revoke_mobile_token(request: Request, token_id: str) -> dict[str, Any]:
+        app_ctx = _app_ctx(request)
+        identity = get_identity(request)
+        assert_admin(identity)
+        clean_id = (token_id or "").strip().lower()
+        if not clean_id or len(clean_id) != 12 or any(c not in "0123456789abcdef" for c in clean_id):
+            raise HTTPException(status_code=400, detail="Invalid mobile token id")
+
+        current_user = (identity.dsm_user or "").strip().lower()
+        tokens_dir = _mobile_tokens_dir(request)
+        revoked = False
+        for path in tokens_dir.glob(f"{clean_id}*.json"):
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+                rec_user = str(rec.get("username") or "").strip().lower()
+                if current_user and rec_user and rec_user != current_user:
+                    continue
+                path.unlink(missing_ok=True)
+                revoked = True
+            except OSError:
+                continue
+
+        if not revoked:
+            raise HTTPException(status_code=404, detail="Mobile access link not found")
+        app_ctx.db.log_event("INFO", "auth", f"Revoked personal mobile access link ({clean_id})")
+        return {"ok": True, "id": clean_id}
 
     return router

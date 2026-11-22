@@ -85,6 +85,7 @@ def _extract_target_path_and_query():
     target_path = None
     desktop_dsm_user = ""
     syno_token = ""
+    mobile_token = ""
     forwarded_pairs = []
     for k, v in pairs:
         if k == "p" and target_path is None:
@@ -93,6 +94,8 @@ def _extract_target_path_and_query():
             desktop_dsm_user = v
         elif k in ("syno_token", "SynoToken") and not syno_token:
             syno_token = v
+        elif k == "token" and not mobile_token:
+            mobile_token = v
         else:
             forwarded_pairs.append((k, v))
 
@@ -109,11 +112,13 @@ def _extract_target_path_and_query():
         target_path = "/" + target_path
 
     forwarded_qs = urllib.parse.urlencode(forwarded_pairs, doseq=True)
-    return target_path, forwarded_qs, desktop_dsm_user, syno_token
+    return target_path, forwarded_qs, desktop_dsm_user, syno_token, mobile_token
 
 
 def main():
-    target_path, forwarded_qs, desktop_dsm_user, syno_token = _extract_target_path_and_query()
+    target_path, forwarded_qs, desktop_dsm_user, syno_token, mobile_token = (
+        _extract_target_path_and_query()
+    )
     method = os.environ.get("REQUEST_METHOD", "GET").upper()
 
     proto = "https" if os.environ.get("HTTPS", "").lower() in ("on", "1", "true") else "http"
@@ -122,9 +127,27 @@ def main():
     is_https = proto == "https"
 
     dsm_user, dsm_is_admin, set_cookie, auth_err = dsm_auth.authenticate_proxy_request(
-        desktop_dsm_user, is_https, syno_token=syno_token
+        desktop_dsm_user, is_https, syno_token=syno_token, mobile_token=mobile_token
     )
     if not dsm_user:
+        if auth_err == "invalid_mobile_token":
+            msg = (
+                "This personal mobile access link is invalid or has been revoked. "
+                "Generate a new link from Settings & Connections inside DSM."
+            )
+            if method == "GET" and target_path == "/":
+                dsm_auth.write_response(
+                    403,
+                    [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+                    render_auth_error_html("Mobile Access Link Revoked", msg),
+                )
+            else:
+                dsm_auth.write_response(
+                    403,
+                    [("Content-Type", "application/json; charset=utf-8")],
+                    json.dumps({"detail": msg}).encode("utf-8"),
+                )
+            return
         if auth_err == "missing_user":
             msg = (
                 "Could not determine your Synology DSM username from the desktop session. "

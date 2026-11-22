@@ -29,9 +29,12 @@ BACKEND_BASE = os.environ.get("GPHOTOS_BACKEND_URL", "http://127.0.0.1:8765").rs
 UI_PREFIX = "/webman/3rdparty/gphotos-migrator"
 DEFAULT_SECRET_FILE = "/var/packages/gphotos-migrator/var/proxy.secret"
 DEFAULT_BRIDGE_DIR = "/var/packages/gphotos-migrator/var/sessions"
+DEFAULT_MOBILE_TOKENS_DIR = "/var/packages/gphotos-migrator/var/config/mobile_tokens"
 DEFAULT_DSM_WEBAPI_URL = "https://localhost:5001/webapi/entry.cgi"
 BRIDGE_COOKIE_NAME = "gphotos_dsm_bridge"
+MOBILE_TOKEN_COOKIE_NAME = "gphotos_mobile_token"
 DEFAULT_BRIDGE_TTL_SECONDS = 1800
+MOBILE_TOKEN_COOKIE_MAX_AGE = 365 * 24 * 3600
 DSM_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
 
 # Lightweight auth-required DSM APIs tried in order before falling back to Initdata:
@@ -79,6 +82,10 @@ def get_dsm_webapi_url():
 
 def get_bridge_dir():
     return os.environ.get("GPHOTOS_BRIDGE_DIR", DEFAULT_BRIDGE_DIR).strip()
+
+
+def get_mobile_tokens_dir():
+    return os.environ.get("GPHOTOS_MOBILE_TOKENS_DIR", DEFAULT_MOBILE_TOKENS_DIR).strip()
 
 
 def get_bridge_ttl_seconds():
@@ -178,7 +185,9 @@ def compute_dsm_session_fingerprint(cookie_header):
         material = "id=%s&_SSID=%s" % (id_val, ssid_val)
     else:
         filtered = sorted(
-            (k, v) for k, v in cookies.items() if k != BRIDGE_COOKIE_NAME
+            (k, v)
+            for k, v in cookies.items()
+            if k not in (BRIDGE_COOKIE_NAME, MOBILE_TOKEN_COOKIE_NAME)
         )
         if not filtered:
             return ""
@@ -214,9 +223,13 @@ def validate_dsm_session_via_webapi(cookie_header, syno_token=None):
     if not cookie_header or not cookie_header.strip():
         return False, None
 
-    # Strip our own bridge cookie before forwarding to DSM webapi
+    # Strip our own cookies before forwarding to DSM webapi
     cookies = parse_cookies(cookie_header)
-    dsm_pairs = ["%s=%s" % (k, v) for k, v in cookies.items() if k != BRIDGE_COOKIE_NAME]
+    dsm_pairs = [
+        "%s=%s" % (k, v)
+        for k, v in cookies.items()
+        if k not in (BRIDGE_COOKIE_NAME, MOBILE_TOKEN_COOKIE_NAME)
+    ]
     if not dsm_pairs:
         return False, None
     forward_cookie = "; ".join(dsm_pairs)
@@ -405,11 +418,74 @@ def mint_bridge_cookie(username, dsm_fp, is_https):
     return "; ".join(attrs)
 
 
-def authenticate_proxy_request(desktop_dsm_user, is_https, syno_token=None):
+def _mobile_token_file_path(raw_token):
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    return os.path.join(get_mobile_tokens_dir(), token_hash + ".json")
+
+
+def build_mobile_token_cookie(raw_token, is_https):
+    attrs = [
+        "%s=%s" % (MOBILE_TOKEN_COOKIE_NAME, raw_token),
+        "Path=%s/" % UI_PREFIX,
+        "HttpOnly",
+        "SameSite=Lax",
+        "Max-Age=%d" % MOBILE_TOKEN_COOKIE_MAX_AGE,
+    ]
+    if is_https:
+        attrs.append("Secure")
+    return "; ".join(attrs)
+
+
+def validate_mobile_token(raw_token):
+    """Validate a personal revocable mobile access token.
+
+    Returns `username` (str) if the token exists on disk, is valid, and belongs to an
+    active DSM administrator; otherwise returns `None` (fail closed).
+    """
+    if not raw_token:
+        return None
+    tok = str(raw_token).strip()
+    if len(tok) < 32 or sanitize_header_part(tok) is None:
+        return None
+
+    path = _mobile_token_file_path(tok)
+    if not os.path.isfile(path):
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except Exception:
+        return None
+
+    username = str(rec.get("username", "")).strip()
+    if not is_valid_dsm_username(username) or not is_dsm_admin(username):
+        return None
+
+    # Best-effort throttled last_used_at update (at most once every 5 minutes)
+    now = time.time()
+    last_touch = float(rec.get("last_used_epoch", 0) or 0)
+    if (now - last_touch) >= 300:
+        try:
+            rec["last_used_epoch"] = now
+            rec["last_used_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+            tmp_path = path + ".tmp.%d" % os.getpid()
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as out_fh:
+                json.dump(rec, out_fh)
+            os.replace(tmp_path, path)
+        except Exception:
+            pass
+
+    return username
+
+
+def authenticate_proxy_request(desktop_dsm_user, is_https, syno_token=None, mobile_token=None):
     """Authenticate a `proxy.cgi` request.
 
     Returns `(username, is_admin, set_cookie_header_or_None, error_code_or_None)`.
-    `error_code` is one of: `None`, `"invalid_session"`, `"missing_user"`, `"user_mismatch"`, `"not_admin"`.
+    `error_code` is one of: `None`, `"invalid_session"`, `"missing_user"`, `"user_mismatch"`,
+    `"invalid_mobile_token"`, `"not_admin"`.
     """
     if is_skip_auth_test_mode():
         user = os.environ.get("GPHOTOS_TEST_DSM_USER", "admin").strip()
@@ -419,6 +495,28 @@ def authenticate_proxy_request(desktop_dsm_user, is_https, syno_token=None):
 
     hint_user = (desktop_dsm_user or "").strip()
     cookie_header = os.environ.get("HTTP_COOKIE", "")
+
+    # 1. Explicit personal mobile access link (?token=...) — opt-in per-user revocable token
+    if mobile_token:
+        tok_user = validate_mobile_token(mobile_token)
+        if not tok_user:
+            return None, False, None, "invalid_mobile_token"
+        if hint_user and tok_user.lower() != hint_user.lower():
+            return None, False, None, "user_mismatch"
+        return tok_user, True, build_mobile_token_cookie(mobile_token.strip(), is_https), None
+
+    # 2. Existing HttpOnly personal mobile token cookie (re-validated against disk on every request
+    #    so revoking a token immediately invalidates active phone sessions)
+    cookies = parse_cookies(cookie_header)
+    cookie_mobile_tok = cookies.get(MOBILE_TOKEN_COOKIE_NAME, "").strip()
+    if cookie_mobile_tok:
+        tok_user = validate_mobile_token(cookie_mobile_tok)
+        if tok_user:
+            if hint_user and tok_user.lower() != hint_user.lower():
+                return None, False, None, "user_mismatch"
+            return tok_user, True, None, None
+
+    # 3. Standard DSM session bridge cookie
     bridge = load_valid_bridge(cookie_header)
     if bridge is not None:
         username, admin_flag = bridge
@@ -426,6 +524,7 @@ def authenticate_proxy_request(desktop_dsm_user, is_https, syno_token=None):
             return None, False, None, "user_mismatch"
         return username, admin_flag, None, None
 
+    # 4. Strict DSM webapi session validation
     valid_session, server_user = validate_dsm_session_via_webapi(
         cookie_header, syno_token=syno_token
     )

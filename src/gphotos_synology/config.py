@@ -223,6 +223,13 @@ class Settings(BaseSettings):
             if username.strip()
         }
 
+    @property
+    def mobile_tokens_dir(self) -> Path:
+        override = os.environ.get("GPHOTOS_MOBILE_TOKENS_DIR", "").strip()
+        if override:
+            return Path(override)
+        return self.data_dir / "mobile_tokens"
+
     def ensure_directories(self) -> None:
         for directory in (
             self.data_dir,
@@ -231,13 +238,17 @@ class Settings(BaseSettings):
             self.inbox_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            self.photos_dir.mkdir(parents=True, exist_ok=True)
+        # Do not force-create photos_dir if its parent (e.g. /volume1) is not writable
+        # and Synology Shared Space (/volume1/photo) was never enabled.
 
     def is_photos_dir_writable(self) -> bool:
-        """Return True if the process can create/write files inside photos_dir."""
+        """Return True if photos_dir is writable OR does not exist (e.g., unused Shared Space).
+
+        Only returns False when photos_dir exists on disk and writing to it is denied.
+        """
+        if not self.photos_dir.exists():
+            return True
         try:
-            self.photos_dir.mkdir(parents=True, exist_ok=True)
             probe = self.photos_dir / f".gphotos_write_probe_{os.getpid()}"
             probe.write_bytes(b"ok")
             probe.unlink(missing_ok=True)
