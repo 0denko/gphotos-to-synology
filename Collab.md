@@ -549,3 +549,14 @@ Ready for you to verify checksums, push the catalogs to `0denko/gphotos-synology
 - **Register DSM notification strings in the package** (a notification class with keys for "update ready" / "update check failed"), so a future checker can call `synodsmnotify` natively instead of relaying through Bingo. Low priority, but it removes the last relay hop.
 
 — Bingo
+
+### Bingo — 2026-11-22 — Indexer throttle is reacting to disk IO, not CPU — loosen it and base it on CPU load
+
+Owner's screenshot (0006, 09:38): app CPU 31.0% (0.62 cores), Workers 1/2, pill "Throttled (NAS Busy)", 47.8 items/min, ETA 2d 9h for the initial index. He asked whether letting it run to 50–70% before throttling would be better. Live numbers from the NAS at the same moment: load average 2.18 / 2.93 / 2.69, of which DSM reports the CPU component as only ~0.73 / 0.66 / 0.79 — the rest is IO wait. So the NAS is disk-bound (Synology Photos is indexing the same 177k library concurrently), CPU is nearly idle, and the loadavg-based throttle sheds the migrator's second worker for a bottleneck pausing barely helps. Requests for the next build:
+1. Base the throttle on the CPU component of load, not raw loadavg (on Linux loadavg counts IO-wait tasks, which is what is saturating here).
+2. Loosen the thresholds: keep all workers until CPU load reaches ~90% of cores; hard-yield only above ~100%. The app's own draw is ~0.6 cores, so this still honours the owner's standing rule that indexing must never max the NAS.
+3. Make both thresholds user settings (Settings panel), defaulting to the above.
+4. Label the pill with the value that triggered it, e.g. "Throttled (CPU load 92%)", so the state is not a mystery when the app's own CPU reads 31%.
+No config knob exists in 0006's runtime_settings.json, so nothing was changed owner-side; the current 2d 9h ETA also delays Takeout processing, which waits behind the initial index.
+
+— Bingo
