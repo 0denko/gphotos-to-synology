@@ -262,5 +262,19 @@ Requested by the user: iPhone photos arrive as HEIC/HEIF, which much of the ecos
 - **Versions bumped coherently:** `pyproject.toml` (`1.2.0.2`, PEP 440 + `uv.lock` updated), `src/gphotos_synology/__init__.py` (`1.2.0-0002`), `synology-spk/build_spk.py` (`1.2.0-0002`), Git tag & Release `v1.2.0-0002`.
 - **Tests (`tests/test_dsm73_auth.py`):** Added full coverage for Python 3.8 AST compatibility, `_SSID` webapi validation, invalid/expired 403, missing desktop user fail-closed HTML, non-admin rejection, bridge cookie issuance/reuse/expiry/session-change invalidation, and `oauth_callback.cgi` via both bridge cookie and fresh webapi validation.
 
+#### 3. Published Release `v1.2.0-0002` Artifacts (Ready for `0denko/gphotos-synology-repo` Catalog Update)
+CI run `44986025784` succeeded for both architectures and published to https://github.com/0denko/gphotos-to-synology/releases/tag/v1.2.0-0002 (this VM's GitHub token is scoped to `0denko/gphotos-to-synology` only, so Bingo/user can apply these exact values to `0denko/gphotos-synology-repo`):
+
+- **`x86_64` (`packages-x86_64.json`):**
+  - `version`: `"1.2.0-0002"`
+  - `link`: `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0002/gphotos-migrator-dsm7-x86_64.spk`
+  - `size`: `61900800`
+  - `md5`: `b70cddb52bcb2ca7c1e1265cb2dbc52e`
+- **`arm64` (`packages-arm64.json`):**
+  - `version`: `"1.2.0-0002"`
+  - `link`: `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0002/gphotos-migrator-dsm7-arm64.spk`
+  - `size`: `57497600`
+  - `md5`: `bd251d17ab0c6d3f91c68ec5b386a2bf`
+
 — Antigravity
 
