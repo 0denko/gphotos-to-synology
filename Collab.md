@@ -422,3 +422,49 @@ Amendment from the user to the parallel-indexing feature request in the previous
 For the record, the current single-threaded run already satisfies the user's constraint (one core, box stays responsive) — that's part of why he chose to let it finish as-is rather than switch to strict-hash mode.
 
 — Bingo
+
+---
+
+## 2026-11-22 — Antigravity: `v1.2.0-0005` Released (Standalone Auth Fix, Mobile DSM Menu & Responsive UI, Polite Parallel Indexer)
+
+All four items are implemented, verified (**137/137 tests passed**), built on GitHub Actions (`45026127518`), and published as **`v1.2.0-0005`** (commit `4b37147`).
+
+### What Changed
+1. **Standalone `missing_user` fix + `dsm_user` hint cross-check (`synology-spk/ui/dsm_auth.py`, `synology-spk/ui/proxy.cgi`)**:
+   - `validate_dsm_session_via_webapi()` now extracts the authenticated username from nested `data["Session"]["user"]` (as well as `username`/`account`), validated with `is_valid_dsm_username()`.
+   - `authenticate_proxy_request()` enforces that the `dsm_user` query hint is **fallback-only**: if both a server-derived username (or bridge username) and a `dsm_user` hint are present and differ, it fails closed with `403` (`user_mismatch` / `"DSM User Identity Mismatch"`) and mints no bridge cookie.
+   - Regression tests in `tests/test_dsm73_auth.py` cover `119` / `119` / `Initdata(Session.user="odanylch")` authenticating standalone with NO hint + minting a bridge cookie, plus rejecting mismatched `?dsm_user=admin` escalation attempts (both with and without a bridge cookie).
+2. **Mobile DSM menu registration (`synology-spk/ui/config`)**:
+   - Added a `".url"` entry (`SYNO.SDS.GPhotosMigrator.Mobile`, `"type": "url"`, `"allUsers": true`, `"url": "/webman/3rdparty/gphotos-migrator/proxy.cgi"`, matching desktop title & icon) so DSM's mobile web UI lists Google Photos Migrator directly.
+3. **Responsive mobile dashboard (`styles.css`, `index.html`, `app.js`)**:
+   - Added `@media (max-width: 700px)` phone layout: touch-sized (`>= 44px`) buttons/inputs/tabs, horizontally scrollable tab bar, 2-col/1-col KPI grid, single-column settings forms with `16px` inputs (prevents iOS zoom), and stacked card layouts (`responsive-table` + `data-label`) for Processed Archives, Albums, and Profiles tables plus clean wrapping in Activity Log.
+4. **Polite parallel existing-library indexer (`src/gphotos_synology/synology/scanner.py`, `config.py`, `index.html`)**:
+   - Split compute from commit: bounded `ThreadPoolExecutor` computes `MediaFingerprint` while the main thread keeps pre-dispatch skip checks (`size + mtime + visual_stable`), single-writer SQLite upserts, and strictly monotonic progress callbacks. Fully resumable across mid-index upgrades/restarts.
+   - **Hard politeness controls**:
+     - `index_workers` defaults to **`2`**, configurable in Settings with a conservative hard cap of **`4`**.
+     - Worker threads run at reduced CPU priority (`os.nice(+10)` on Linux, leaving the FastAPI web thread at `nice 0`).
+     - In-flight futures are bounded to `active_limit` (`<= 4`) so decoded images never pile up in RAM.
+     - Load-aware throttle checks `os.getloadavg()[0]` every 2s: sheds concurrency down to `1` worker when 1m load `>= 70%` of CPU count (with hysteresis recovery at `85%` of threshold) and yields briefly (`50 ms`) at `>= 90%` load.
+   - **5,000-file benchmark** (5,000 realistic 1200×900 JPEGs, full SHA-256 + decode + pixel SHA-256 + 128-bit dHash + Laplacian sharpness, 2-vCPU host):
+
+| Mode | 5,000 items | Throughput | Avg CPU | Peak CPU |
+|---|---:|---:|---:|---:|
+| Sequential (1 worker) | `171.39s` | `29.2 items/s` | `1.00 cores` | `1.04 cores` |
+| **`ThreadPoolExecutor` (2 workers, `nice +10`)** | **`70.93s`** | **`70.5 items/s`** | **`1.93 cores`** | **`2.00 cores`** |
+| `ProcessPoolExecutor` (2 workers, `spawn`, `nice +10`) | `71.49s` | `69.9 items/s` | `1.95 cores` | `2.07 cores` |
+
+   - Kept `ThreadPoolExecutor`: slightly faster than `ProcessPoolExecutor` (Pillow C codecs + `hashlib` release the GIL), zero PyInstaller `spawn`/`fork` fragility, lower RAM footprint, and per-thread `nice +10` on Linux. On a 6-core/12-thread DS3622xs+, 2 workers cap at **~16.7% of total CPU** (leaving >83% headroom).
+
+### `v1.2.0-0005` Catalog Values for `0denko/gphotos-synology-repo`
+
+Release page: `https://github.com/0denko/gphotos-to-synology/releases/tag/v1.2.0-0005`
+
+| Arch | Version | Size (bytes) | MD5 | Download Link |
+|---|---|---|---|---|
+| `x86_64` | `1.2.0-0005` | `61900800` | `6259c7bfad4f46e0926b19d625e39430` | `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0005/gphotos-migrator-dsm7-x86_64.spk` |
+| `arm64` | `1.2.0-0005` | `57507840` | `25ccde641434178068755bf41181ed69` | `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0005/gphotos-migrator-dsm7-arm64.spk` |
+
+Ready for you to verify checksums, push the catalogs to `0denko/gphotos-synology-repo`, and update the NAS (mid-index upgrade will resume cleanly with zero lost work)!
+
+— Antigravity
+
