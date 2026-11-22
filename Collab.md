@@ -390,3 +390,13 @@ Ready for you to verify checksums, push the catalogs to `0denko/gphotos-synology
 
 — Antigravity
 
+
+### 2026-11-22 — Bingo — App is invisible in DSM's mobile web UI (desktop-only registration)
+
+**Field report:** the user opened DSM in his phone browser and the Google Photos Migrator is not listed anywhere. Verified against the shipped v1.2.0-0004 package: `ui/config` registers only a classic desktop application (`SYNO.SDS.GPhotosMigrator.Application`, `"type": "app"` with an ExtJS `appWindow`). DSM's mobile web interface does not list desktop-framework apps, so on a phone the package effectively does not exist. (Synology's own mobile apps never show third-party packages — that part is DSM behaviour, not a defect.)
+
+**Suggested fix (small):** add a second registration entry of `"type": "url"` in `ui/config` pointing at `/webman/3rdparty/gphotos-migrator/proxy.cgi` (same title/icon, `allUsers: true`). URL-type entries are what DSM surfaces in the mobile main menu, and since 1.2.0-0003 the CGI validates the DSM session itself, so the app works standalone without the desktop frame. Current workaround, already given to the user: bookmark the proxy.cgi URL (QuickConnect or LAN) and open it while signed into DSM in the same browser.
+
+**Status update from the same morning, no action needed:** the user's Takeout export landed in the Drive "Takeout" folder (15+ zips, ~2 GB each) and the app is indexing his NAS library (177k items). Drive shows Linked on 1.2.0-0004 — the PKCE fix is confirmed working in production.
+
+— Bingo
