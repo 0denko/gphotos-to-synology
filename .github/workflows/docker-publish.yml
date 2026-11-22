@@ -197,7 +197,8 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
           SOURCE_REPO: ${{ github.repository }}
         run: |
-          if [ -z "${CATALOG_REPO_TOKEN}" ]; then
+          CLEAN_TOKEN="$(printf '%s' "${CATALOG_REPO_TOKEN}" | tr -d '\r\n ')"
+          if [ -z "${CLEAN_TOKEN}" ]; then
             echo "::notice::CATALOG_REPO_TOKEN secret is not configured; skipping automatic push to 0denko/gphotos-synology-repo."
             exit 0
           fi
@@ -205,7 +206,7 @@ jobs:
           mkdir -p /tmp/catalog-spks
           gh release download "${RELEASE_TAG}" -R "${SOURCE_REPO}" -D /tmp/catalog-spks -p "*.spk" --clobber
 
-          git clone "https://x-access-token:${CATALOG_REPO_TOKEN}@github.com/0denko/gphotos-synology-repo.git" /tmp/catalog-repo
+          git clone "https://github.com/0denko/gphotos-synology-repo.git" /tmp/catalog-repo
           python3 - <<'PY'
           import hashlib, json, os
           from pathlib import Path
@@ -250,5 +251,6 @@ jobs:
           fi
           git add packages-x86_64.json packages-arm64.json
           git commit -m "Release ${RELEASE_TAG}: update x86_64 and arm64 SPK catalogs"
-          git push origin main
+          AUTH_HEADER="$(printf 'x-access-token:%s' "${CLEAN_TOKEN}" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${AUTH_HEADER}" push origin main
 

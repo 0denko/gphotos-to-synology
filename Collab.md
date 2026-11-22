@@ -607,3 +607,38 @@ Owner feedback today: the `?launchApp=` link opens DSM's desktop with the app in
 Proposal for a future build: a **personal mobile access link** generated from the dashboard Settings — the app mints a high-entropy, per-user, revocable token; the backend accepts `proxy.cgi?token=...` (or a token cookie it sets) as standalone auth for that DSM user only, shown with a warning and a revoke button. DSM session auth stays the default and the token path is opt-in per user. This mirrors long-lived access tokens in Home Assistant / Plex and gives the owner a true home-screen app icon without weakening the fail-closed default.
 
 — Bingo
+
+---
+
+## 2026-11-22 — Antigravity: `v1.2.0-0008` Released (Missing `/volume1/photo` Fix, Menu Cleanup, Personal Mobile Access Links)
+
+All three items are implemented, verified (**142/142 tests passed**), built on GitHub Actions (`45050442070`), and published as **`v1.2.0-0008`** (commit `c3b0d1d`).
+
+### What Changed
+1. **Missing `/volume1/photo` treated as normal state (`config.py`, `scanner.py`)**:
+   - `Settings.is_photos_dir_writable()` now returns `True` when `photos_dir` does not exist (e.g. Synology Photos Shared Space never enabled), and only returns `False` when the folder **exists** and write access is actually denied.
+   - `ExistingLibraryScanner.scan()` no longer calls `mkdir()` on a missing `photos_dir`; it logs a single `INFO` line once per process and returns an empty `LibraryScanResult()` with zero errors and no permission banner.
+2. **Removed duplicate `.url` desktop menu entry (`synology-spk/ui/config`)**:
+   - Removed the `.url` entry now that DSM 7's mobile app list is confirmed closed to third-party packages — leaving the single clean desktop Main Menu entry (`SYNO.SDS.GPhotosMigrator.Application`).
+3. **Opt-in Personal Mobile Access Links (`dsm_auth.py`, `proxy.cgi`, `routes.py`, `build_spk.py`, `index.html`, `app.js`)**:
+   - Added a **Personal Mobile Access Link** card in Settings & Connections (with security warning, optional device label, one-time copyable full-screen URL, and instant **Revoke** button).
+   - Backend (`GET/POST/DELETE /api/mobile-tokens`) mints 256-bit `secrets.token_urlsafe(32)` tokens stored hashed (`SHA-256`, `0600`) in `${PKG_VAR}/config/mobile_tokens/`.
+   - Opening `proxy.cgi?token=<raw_token>` on a phone (or saving it via Safari/Chrome → **Add to Home Screen**) authenticates strictly as that DSM admin user, sets an `HttpOnly; SameSite=Lax; Secure` `gphotos_mobile_token` cookie for follow-up API calls, strips `token` before forwarding upstream, and re-validates against disk on every request so **Revoke** invalidates both the URL and active cookies immediately.
+   - DSM session auth remains the strict fail-closed default when no mobile tokens are issued.
+4. **Note on `publish-catalog` CI job (`45050442070`)**:
+   - The job downloaded both SPKs, computed the exact sizes/MD5s, updated `packages-x86_64.json` and `packages-arm64.json`, and committed cleanly — then `git push` returned `remote: Invalid username or token`.
+   - Updated `.github/workflows/docker-publish.yml` to strip any whitespace/newline from `CATALOG_REPO_TOKEN` and pass it via `http.https://github.com/.extraheader=AUTHORIZATION: basic ...` for the next release. (If `CATALOG_REPO_TOKEN` itself needs a fresh value or `Contents: Read and write` re-confirmed on `0denko/gphotos-synology-repo`, worth double-checking once.)
+
+### `v1.2.0-0008` Catalog Values for `0denko/gphotos-synology-repo`
+
+Release page: `https://github.com/0denko/gphotos-to-synology/releases/tag/v1.2.0-0008`
+
+| Arch | Version | Size (bytes) | MD5 | Download Link |
+|---|---|---|---|---|
+| `x86_64` | `1.2.0-0008` | `61911040` | `69e57cd896380d385f0093327a39838d` | `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0008/gphotos-migrator-dsm7-x86_64.spk` |
+| `arm64` | `1.2.0-0008` | `57518080` | `9d6f86ad7ac567cdaeeba384d5f615ab` | `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0008/gphotos-migrator-dsm7-arm64.spk` |
+
+Ready for you to push `v1.2.0-0008` to `0denko/gphotos-synology-repo` and update the NAS!
+
+— Antigravity
+
