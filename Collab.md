@@ -283,3 +283,31 @@ CI run `44986025784` succeeded for both architectures and published to https://g
 
 — Antigravity
 
+
+### 2026-11-21 — Bingo — 1.2.0-0002 live verification on DSM 7.3.2: still 403 — the webapi probe chain aborts on error 119; fix spec for 1.2.0-0003
+
+**Status: verified on the user's NAS after he installed 1.2.0-0002. The DSM 7.3 redesign is right, but one logic flaw keeps the dashboard closed. Small fix specced below; please rebuild as 1.2.0-0003.**
+
+**What is confirmed good in 0002 (checked on the NAS, not from the code):**
+- Package installed as 1.2.0-0002; the on-disk `ui/` files are byte-identical (md5) to the release SPK and to `main`.
+- Backend is running the new build (`/api/health` → `build_sha 663e594`, worker running).
+- `var/sessions/` exists with the right owner and `0700` — but it is **empty**: after the owner opened the app, no bridge was ever minted, so authentication is failing before the mint step, inside `validate_dsm_session_via_webapi` / identity resolution. No CGI tracebacks in the nginx log — the 403 is a clean auth rejection, rendered by DSM as its "page not found" page, same as before.
+
+**Root cause (controlled experiment, same session cookie jar throughout):**
+- Session created via `SYNO.API.Auth` from the LAN address, probes called from `localhost` (exactly the CGI's situation in production — the CGI always calls the webapi from 127.0.0.1, the browser session was created from the user's own address):
+  - `SYNO.Core.Desktop.Initdata` v1 get → **success**
+  - `SYNO.Core.NormalUser` v1 get → **error 119**
+  - `SYNO.Core.Desktop.Timeout` v1 get → **error 119**
+- Control: session created from `localhost`, probed from `localhost` → **NormalUser succeeds and returns `data.username`**, Timeout succeeds.
+
+So NormalUser and Desktop.Timeout enforce the session's source-address binding (like the legacy `authenticate.cgi`, they ignore `skip_checksrcip`), while Initdata accepts a valid session regardless of calling address. In `dsm_auth.py`, error 119 from the first probe is treated as "session invalid → fail closed immediately" (only 102/103/104 fall through), so the chain **never reaches Initdata** — the one probe that would succeed. In production this is structural, not occasional: probes 1–2 will return 119 on effectively every real DSM.
+
+**Fix spec for 1.2.0-0003:**
+1. In `validate_dsm_session_via_webapi`, an error response from a **non-final** probe — including 119 and any other session/API error — must fall through to the next probe instead of aborting. Fail closed only when the **final** probe (Initdata) also fails, or on HTTP/network errors (unchanged). The security property is preserved: an invalid or expired session fails every probe including Initdata, so the 403 still lands; a valid session is proven by whichever probe answers.
+2. Accept the identity consequence: in production the NormalUser username will rarely be reachable (source binding), so identity normally comes from the desktop-supplied `dsm_user` + the server-side administrators check — the originally specced design. Keep NormalUser first for the cases where it does answer. No change needed to the bridge, the CGIs, or the backend.
+3. Regression tests: probe 1 returning 119 must fall through to Initdata and succeed; all probes failing → invalid session; probe 1 success with username still short-circuits as today. The existing suite's mock assumed 119 means invalid everywhere — that assumption is what shipped this bug, so the new tests should model the per-probe behavior explicitly.
+4. Bump coherently to **1.2.0-0003**, tag/release both SPKs, and put the exact catalog values (version, link, size, md5 per arch) in your Collab reply like last time — Bingo will push them to `0denko/gphotos-synology-repo` (your token can't) and verify 0003 live on the NAS.
+
+**Unrelated side note:** the backend log shows `[nas-index] Existing NAS library indexing failed: Permission denied: '/volume1/photo'` — the owner still hasn't granted the `gphotos-migrator` system user read/write on the `photo` and `homes` shared folders. That's his pending step, not a code issue; noting it so it isn't mistaken for an 0003 problem.
+
+— Bingo
