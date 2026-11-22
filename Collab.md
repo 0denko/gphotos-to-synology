@@ -489,3 +489,37 @@ Owner is re-testing the main-menu (desktop) launch on the phone under 0005; if t
 Owner, watching the new parallel indexer on the phone: the worker card shows only raw counts (12975/177238) — "There's no eta or cpu load here." Fair point, and slightly ironic: 0005's headline behaviour is polite CPU discipline, but the UI surfaces none of it, so the politeness is unverifiable from the dashboard.
 
 Requested status additions for the indexing phase: (1) rolling scan rate (items/min over the last few minutes, not a lifetime average — the rate differs sharply between already-indexed skips and fresh fingerprinting); (2) ETA for the current phase computed from that rolling rate and the remaining count; (3) worker CPU load (backend process CPU% is fine) plus the active indexer worker count and a visible indicator when the load-aware throttle has shed workers. All three are cheap: the scanner already tracks progress, and CPU is one /proc read. Same treatment would suit the archive-processing phase when it starts.
+
+---
+
+## 2026-11-22 — Antigravity: `v1.2.0-0006` Released (`SynoToken` Forwarding, Menu Cleanup, Live Worker Telemetry)
+
+Owner asked us to do what is **best and safest** — so we kept strict server-verified auth (no cookie-only privilege-escalation fallback), fixed the `SynoToken` gate for DSM launches, removed the duplicate `.url` menu entry, and added the full Live Background Worker telemetry strip. Verified (**139/139 tests passed**), built on GitHub Actions (`45029434875`), and published as **`v1.2.0-0006`** (commit `81047af`).
+
+### What Changed
+1. **Strict `SynoToken` forwarding (`synology-spk/ui/GPhotosMigrator.js`, `proxy.cgi`, `dsm_auth.py`)**:
+   - `GPhotosMigrator.js` now reads `SYNO.SDS.Session.SynoToken` alongside `dsm_user` and passes `syno_token` on the initial iframe load.
+   - `proxy.cgi` extracts and strips `syno_token` (or `X-SYNO-TOKEN` header) before forwarding upstream to FastAPI so tokens are never leaked to backend URLs/logs.
+   - `validate_dsm_session_via_webapi()` sends `SynoToken` (query param) and `X-SYNO-TOKEN` (header) on loopback DSM probes so `Initdata` returns the full `Session.user` identity even on foreign-IP sessions, keeping the server-side cross-check genuinely enforced.
+   - Standalone cookie-only requests without `SynoToken` remain strictly fail-closed (`403 missing_user`).
+   - Added regression test `test_dsm73_synotoken_upgrades_degraded_initdata_and_enforces_crosscheck` in `tests/test_dsm73_auth.py`.
+2. **Removed duplicate `.url` menu registration (`synology-spk/ui/config`)**:
+   - Removed the `.url` entry that caused duplicate "Google Photos Migrator" icons in the DSM Main Menu and malformed mobile icon requests, leaving the single clean desktop app entry (`SYNO.SDS.GPhotosMigrator.Application`).
+3. **Live Background Worker telemetry (`scanner.py`, `pipeline.py`, `index.html`, `styles.css`, `app.js`)**:
+   - **Rolling scan rate (`items/min`)**: computed over a 120-second rolling window (not lifetime average) for both `indexing_nas` and `importing` phases, so fast already-indexed skip bursts drop out quickly once fresh fingerprinting starts.
+   - **Phase ETA**: computed from the rolling rate and remaining item count, formatted cleanly (`45s`, `12m 30s`, `6h 22m`, `1d 4h`).
+   - **Worker CPU load & politeness visibility**: displays backend process CPU% & core-equivalents (`os.times()`), active/configured indexer worker count (`Workers: 2/2`), and a visible amber **`Throttled (NAS Busy)`** pill whenever the load-aware throttle sheds workers.
+
+### `v1.2.0-0006` Catalog Values for `0denko/gphotos-synology-repo`
+
+Release page: `https://github.com/0denko/gphotos-to-synology/releases/tag/v1.2.0-0006`
+
+| Arch | Version | Size (bytes) | MD5 | Download Link |
+|---|---|---|---|---|
+| `x86_64` | `1.2.0-0006` | `61911040` | `e696619760ee001c901070ad19b721e0` | `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0006/gphotos-migrator-dsm7-x86_64.spk` |
+| `arm64` | `1.2.0-0006` | `57507840` | `7ce545283255dec02897d4a5560a91e6` | `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0006/gphotos-migrator-dsm7-arm64.spk` |
+
+Ready for you to verify checksums, push the catalogs to `0denko/gphotos-synology-repo`, and update the NAS!
+
+— Antigravity
+
