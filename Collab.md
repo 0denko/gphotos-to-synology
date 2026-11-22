@@ -357,3 +357,36 @@ CI run `44987795308` succeeded for both architectures (https://github.com/0denko
 - The NAS library indexing and the `/volume1/photo` permission error are resolved on the user's side (indexing ran to 1,330+ items during the same session).
 
 — Bingo
+
+---
+
+## 2026-11-22 — Antigravity: `v1.2.0-0004` Released (PKCE `code_verifier` Fix + QuickConnect/Private-IP UX)
+
+Implemented **Approach 1** (persisting the PKCE `code_verifier` in the one-time, TTL-bound `oauth_state:<state>` record), added a true end-to-end PKCE regression test, documented QuickConnect/DDNS redirect URIs with a live private-IP warning banner, and published **`v1.2.0-0004`** (commit `96d75e5`).
+
+### What Changed
+1. **PKCE `code_verifier` persistence & exchange (`src/gphotos_synology/sources/gdrive.py`, `src/gphotos_synology/web/routes.py`)**:
+   - `build_authorization_url()` now returns `(auth_url, returned_state, flow.code_verifier)`.
+   - `google_oauth_start()` stores `"code_verifier": code_verifier or ""` inside the existing one-time-use, 600s-TTL `oauth_state:<state>` SQLite setting record (preserving all G3 protections).
+   - `google_oauth_callback()` retrieves `bound_code_verifier` and passes `code_verifier=bound_code_verifier` to `gdrive.exchange_code(...)`.
+   - `exchange_code()` constructs `Flow.from_client_config(..., code_verifier=code_verifier, autogenerate_code_verifier=False)` and passes `code_verifier` to `flow.fetch_token(...)`.
+2. **Real PKCE end-to-end regression test (`tests/test_oauth_pkce.py`)**:
+   - Drives `/api/oauth/google/start` → `/api/oauth/google/callback` through real `google-auth-oauthlib` `Flow.fetch_token()` against a local HTTP mock token endpoint that enforces `BASE64URL(SHA256(code_verifier)) == code_challenge` from the authorization URL, verifies `google_token.json` persistence, and verifies one-time state consumption / replay rejection.
+   - Full suite: **133/133 passed** (`pytest`, `ruff check`, `node --check`).
+3. **QuickConnect / DDNS documentation & private-IP redirect URI warning (`index.html`, `app.js`, `README.md`)**:
+   - Documented that Google requires a domain name (QuickConnect direct hostname or DDNS works; private LAN IPs like `192.168.100.97` are hard-blocked by Google with `device_id and device_name are required for private IP`).
+   - Added a live UI warning banner (`#redirect-uri-ip-warning`) in Settings whenever the effective redirect URI targets a private IP (`10.*`, `172.16–31.*`, `192.168.*`, `169.254.*`, `127.*`, IPv6 ULA/link-local).
+
+### `v1.2.0-0004` Catalog Values for `0denko/gphotos-synology-repo`
+
+Release page: `https://github.com/0denko/gphotos-to-synology/releases/tag/v1.2.0-0004`
+
+| Arch | Version | Size (bytes) | MD5 | Download Link |
+|---|---|---|---|---|
+| `x86_64` | `1.2.0-0004` | `61900800` | `a28a01efa97437d782b8c9ef04557604` | `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0004/gphotos-migrator-dsm7-x86_64.spk` |
+| `arm64` | `1.2.0-0004` | `57497600` | `b23c3284bac51dfdf9c93fb3667179fd` | `https://github.com/0denko/gphotos-to-synology/releases/download/v1.2.0-0004/gphotos-migrator-dsm7-arm64.spk` |
+
+Ready for you to verify checksums, push the catalogs to `0denko/gphotos-synology-repo`, update the NAS, and retry **Connect Google Drive**!
+
+— Antigravity
+
