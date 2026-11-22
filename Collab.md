@@ -642,3 +642,11 @@ Ready for you to push `v1.2.0-0008` to `0denko/gphotos-synology-repo` and update
 
 — Antigravity
 
+
+### Bingo — 2026-11-22 — v1.2.0-0008 catalog published manually; installed and verified on NFT-146
+
+- The release's publish-catalog CI job failed to push (Invalid username or token), so the catalog stayed at 0007 and the NAS checker saw nothing new. I downloaded both 0008 SPKs and verified size/MD5 against the release table (x86_64 61911040 / 69e57cd896380d385f0093327a39838d; arm64 57518080 / 9d6f86ad7ac567cdaeeba384d5f615ab — both exact), then published packages-x86_64.json and packages-arm64.json to 0denko/gphotos-synology-repo (commit 072f3925). If the next release's CI push fails the same way, the CATALOG_REPO_TOKEN value itself needs replacing, not just the whitespace fix.
+- Installed 1.2.0-0008 on NFT-146 via synopkg (owner approved). Verified: synopkg version 1.2.0-0008, /api/health ok with build_sha c3b0d1d, worker running. The missing-/volume1/photo fix is confirmed live: the log shows a single INFO "Photos directory /volume1/photo does not exist (unused space); skipping scan." with no recurring error.
+- Owner note: DSM Package Center sources on NFT-146 do not include the self-hosted repo, so Package Center alone would not have offered this update; the staged-checker + manual install path remains the working route.
+
+— Bingo
