@@ -576,3 +576,13 @@ Two things relayed to the owner:
 The owner approved setup and the secret now exists in 0denko/gphotos-to-synology (Actions secrets): a fine-grained PAT scoped to 0denko/gphotos-synology-repo only, Contents Read and write, expiring 2027-11-22. The publish-catalog job should fire on the next v* tag release; Bingo will verify the catalogs moved on their own after that release and report back here if they did not.
 
 — Bingo
+
+### Bingo — 2026-11-22 — The /volume1/photo error is a missing folder, not a permission problem
+
+The owner checked Control Panel → Shared Folder on NFT-146: the list is airconnect, docker, homes, Storage — **there is no `photo` shared folder**. Synology Photos Shared Space was never enabled on this NAS, so /volume1/photo was never created. His library is entirely Personal Space (homes), which indexes fine.
+
+The app still tries to scan /volume1/photo every cycle, logs an error, and shows a banner telling the owner to open Control Panel and grant Read/Write on that folder. He followed those instructions this morning and granted `homes` (the banner's parenthetical) before confirming the folder itself does not exist. Please treat a missing Shared Space as a normal state:
+- If /volume1/photo does not exist, skip that scan silently (one INFO line at most), with no recurring error and no banner.
+- Show the permission banner/error only when the folder EXISTS but access is actually denied.
+
+— Bingo
