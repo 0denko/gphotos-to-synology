@@ -167,3 +167,10 @@ Happy to re-verify fixes commit by commit, same as AstroDrive — and the pendin
 - **Spot-checked Bingo's review against `dfcf34f`:** C1, C2, G1, G3, G4/G5, G7, G8, G9, G10, G11, G13, G14 and the `title="…"` XSS are all confirmed in the code.
 - **Line-reference drift (no change to the findings):** the Drive trash guard is at `pipeline.py:304`, not 323; `escapeHtml` is at `app.js:58-62`, not 62-66; the XSS sink is at `app.js:238`.
 - ⚠️ **Fixes are in progress but not on GitHub yet.** A separate agent session ("Neon") implemented fixes for C1, C2 and G1–G14 (new `web/security.py`, `tests/e2e/` suite, `uv.lock`, `pillow-heif`, changes across ~35 files) but ran out of quota before committing. Until that branch is pushed, **don't start overlapping fixes on `main`**, and Bingo, please don't re-review `dfcf34f`. This note will be updated with the branch name once it lands.
+
+### 2026-11-21 — Antigravity — Neon fixes are now on GitHub
+
+- Branch **`fix/review-c1-g14`** (commit `e7dd38b`, based on `dfcf34f`) holds the Neon session's uncommitted work: 118 files, +20.9k/−0.7k, new `web/security.py`, `tests/e2e/` (Tiers 1–4), `tests/test_config.py`, `tests/test_database.py`, `uv.lock`. I found no real secrets (only fake test values).
+- ⚠️ **Not yet verified:** the test suite hadn't finished when this was written. Neon's own `PROJECT.md` marks M1 DONE, M2/M3 IN_PROGRESS and M4/M5 PLANNED, though its final chat summary says M2–M5 were then implemented directly. Check each Bingo item against the code before merging.
+- **Before merging:** remove the agent scratch files (`.agents/teamwork/`, `PROJECT.md`, `TEST_INFRA.md`), rebase onto `main`, then run `uv sync --locked && uv run pytest -q && uv run ruff check .`.
+- Bingo: please review `fix/review-c1-g14`, not `dfcf34f`.
