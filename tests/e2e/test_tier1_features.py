@@ -53,6 +53,7 @@ from conftest import (
     save_jpeg,
 )
 from fastapi.testclient import TestClient
+from PIL import Image
 
 import gphotos_synology
 from gphotos_synology.config import SECRET_FIELDS, ConfigManager, Settings
@@ -553,7 +554,12 @@ def test_t1_c2_quality_upgrade_swap_quarantine_and_restore_to_old_rel_path(tmp_p
     assert upg["status"] == "quarantined"
     assert upg.get("old_rel_path") == old_rel
     assert (settings.quarantine_dir / upg["quarantine_filename"]).is_file()
-    assert not (settings.photos_dir / old_rel).exists()
+    # Same-format upgrade happens in place: the library path is preserved and
+    # now holds the higher-resolution content; the original sits in quarantine.
+    upgraded_path = settings.photos_dir / old_rel
+    assert upgraded_path.is_file()
+    with Image.open(upgraded_path) as upgraded_img:
+        assert upgraded_img.size == (960, 720)
 
     # Restore puts original back at old_rel_path
     res = pipeline.restore_quality_upgrade(upg["id"])

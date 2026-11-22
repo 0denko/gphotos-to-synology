@@ -803,11 +803,14 @@ class MigrationPipeline:
             safe_move_or_copy(existing_abs, q_path)
             moved_existing = True
 
-            # 2. Place higher-quality image into PHOTOS_DIR (keep same path only if same filename)
-            if existing_abs.name.lower() == incoming_path.name.lower():
+            # 2. Place higher-quality image into PHOTOS_DIR. When the format
+            #    (extension) matches, upgrade in place at the existing library
+            #    path so the media record's path/filename is preserved; only a
+            #    genuine format change imports under the incoming name.
+            if existing_abs.suffix.lower() == incoming_path.suffix.lower():
                 dest_abs = existing_abs
                 safe_move_or_copy(incoming_path, dest_abs)
-                dest_rel = dest_abs.relative_to(settings.photos_dir).as_posix()
+                dest_rel = existing_rel
             else:
                 dest_abs, dest_rel = importer.import_media(incoming_path, metadata)
             placed_dest = dest_abs
