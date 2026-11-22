@@ -133,7 +133,22 @@
     $("kpi-health").textContent =
       `EXIF: ${data.exiftool_available ? "ExifTool" : "Built-in"} · Drive: ${data.gdrive_connected ? "Linked" : "Local Inbox Only"}`;
 
-    $("perm-banner").classList.toggle("hidden", data.photos_dir_writable !== false);
+    const isUnwritable = data.photos_dir_writable === false;
+    $("perm-banner").classList.toggle("hidden", !isUnwritable);
+    if (isUnwritable) {
+      const failingPath = data.photos_dir || (data.profile && data.profile.photos_dir) || "";
+      const pathEl = $("perm-banner-path");
+      if (pathEl) pathEl.textContent = failingPath || "(configured photos directory)";
+      const hintEl = $("perm-banner-hint");
+      if (hintEl) {
+        const isPersonal =
+          (data.profile && data.profile.target_space === "personal") ||
+          failingPath.includes("/homes/");
+        hintEl.innerHTML = isPersonal
+          ? "Grant <strong>Read/Write</strong> for <code>gphotos-migrator</code> on the <code>homes</code> shared folder (<strong>Control Panel → Shared Folder → homes → Permissions → System internal user</strong>) and ensure this user's home <code>Photos</code> folder inherits or includes that ACL."
+          : "Open <strong>Control Panel → Shared Folder</strong>, edit <code>photo</code>, go to <strong>Permissions → System internal user</strong>, and check <strong>Read/Write</strong> for <code>gphotos-migrator</code>.";
+      }
+    }
 
     // Progress bar
     $("worker-step").textContent = progress.current_step || "Idle";

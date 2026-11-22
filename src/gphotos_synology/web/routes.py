@@ -227,6 +227,7 @@ def create_api_router() -> APIRouter:
             "exiftool_available": exiftool_available(settings.exiftool_path),
             "synology_api_enabled": settings.synology_api_enabled,
             "photos_dir_writable": settings.is_photos_dir_writable(),
+            "photos_dir": str(settings.photos_dir),
             "disk": {
                 "work_free_gb": round(get_free_disk_gb(settings.work_dir), 2),
                 "photos_free_gb": round(get_free_disk_gb(settings.photos_dir), 2),

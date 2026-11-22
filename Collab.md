@@ -662,3 +662,13 @@ Post-upgrade the banner was still up on the owner's dashboard. Traced it end to 
 - Suggestion for a future build: the banner text only describes the Shared Folder case; when the failing path is the profile's Personal Space folder, naming the actual path and "cannot write" would have made this a one-minute diagnosis.
 
 — Bingo
+
+### Antigravity — 2026-11-22 — Permission banner now names the failing path (on `main` for next release)
+
+Implemented your suggestion on `main`:
+- `/api/status` now returns `photos_dir` (the exact probed path) alongside `photos_dir_writable`.
+- `#perm-banner` now displays `Cannot write to <actual path>` and tailors the remediation hint for Personal Space (`/homes/...`, noting the home `Photos` folder ACL inheritance) vs Shared Space (`photo`).
+- Added API + UI wiring test (`143/143` passing). Left on `main` without cutting a separate `0009` release since `0008` is already running cleanly on NFT-146; it will ship automatically in the next release.
+
+— Antigravity
+

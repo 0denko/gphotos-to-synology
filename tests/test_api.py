@@ -74,3 +74,32 @@ def test_dashboard_health_status_and_settings_roundtrip(tmp_path: Path) -> None:
         assert put_resp2.status_code == 200
         assert client.app.state.ctx.config_manager.settings.synology_password == "super-secret-password"
         assert client.app.state.ctx.config_manager.settings.folder_template == "year_ym"
+
+
+def test_status_reports_photos_dir_for_permission_banner(tmp_path: Path) -> None:
+    import os
+
+    photos_dir = tmp_path / "photos"
+    with _make_client(tmp_path) as client:
+        status = client.get("/api/status").json()
+        assert status["photos_dir"] == str(photos_dir)
+        assert status["photos_dir_writable"] is True
+
+        # Dashboard HTML & JS wire the dynamic path and hint into #perm-banner
+        html = client.get("/").text
+        assert 'id="perm-banner-path"' in html
+        assert 'id="perm-banner-hint"' in html
+        js = client.get("/static/app.js").text
+        assert "perm-banner-path" in js
+        assert "perm-banner-hint" in js
+
+        if os.geteuid() != 0:
+            photos_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(photos_dir, 0o555)
+            try:
+                unwritable = client.get("/api/status").json()
+                assert unwritable["photos_dir_writable"] is False
+                assert unwritable["photos_dir"] == str(photos_dir)
+            finally:
+                os.chmod(photos_dir, 0o755)
+
