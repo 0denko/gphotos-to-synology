@@ -17,9 +17,16 @@ def _make_client(tmp_path: Path) -> TestClient:
         inbox_dir=tmp_path / "inbox",
         photos_dir=tmp_path / "photos",
         min_free_disk_gb=0.1,
+        api_token="test-api-token",
     )
     app = create_app(base_settings=settings, start_worker=False)
-    return TestClient(app)
+    return TestClient(
+        app,
+        headers={
+            "Authorization": "Bearer test-api-token",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
 
 
 def test_dashboard_health_status_and_settings_roundtrip(tmp_path: Path) -> None:

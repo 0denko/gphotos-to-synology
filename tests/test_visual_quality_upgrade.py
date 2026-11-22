@@ -170,6 +170,7 @@ def test_upgrades_api_preview_restore_and_purge(tmp_path: Path) -> None:
         auto_index_existing_photos=True,
         dedup_mode="perceptual",
         duplicate_quality_policy="auto_upgrade_quarantine",
+        api_token="test-api-token",
     )
     app = create_app(base_settings=settings, start_worker=False)
 
@@ -188,7 +189,11 @@ def test_upgrades_api_preview_restore_and_purge(tmp_path: Path) -> None:
             json.dumps({"title": "SUNSET.jpg", "photoTakenTime": {"timestamp": "1725969600"}}),
         )
 
-    with TestClient(app) as client:
+    auth_headers = {
+        "Authorization": "Bearer test-api-token",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    with TestClient(app, headers=auth_headers) as client:
         app.state.ctx.pipeline.run_cycle()
 
         upgrades = client.get("/api/upgrades").json()["upgrades"]
@@ -208,7 +213,7 @@ def test_upgrades_api_preview_restore_and_purge(tmp_path: Path) -> None:
             assert restored_img.size == (240, 180)
         assert client.get("/api/upgrades").json()["upgrades"][0]["status"] == "restored"
 
-        # Purge endpoint cleans up cleanly
+        # Purging an already-restored upgrade must be rejected (status stays 'restored')
         purge_resp = client.post(f"/api/upgrades/{uid}/purge")
-        assert purge_resp.status_code == 200
-        assert client.get("/api/upgrades").json()["upgrades"][0]["status"] == "purged"
+        assert purge_resp.status_code == 400
+        assert client.get("/api/upgrades").json()["upgrades"][0]["status"] == "restored"

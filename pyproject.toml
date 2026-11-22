@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gphotos-to-synology"
-version = "1.0.0"
+version = "1.2.0"
 description = "Unattended background migration of Google Photos Takeout archives to Synology DSM / Synology Photos"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,7 +20,8 @@ dependencies = [
     "google-auth>=2.35.0,<3.0.0",
     "google-auth-oauthlib>=1.2.0,<2.0.0",
     "python-multipart>=0.0.12,<1.0.0",
-    "pillow>=10.4.0,<13.0.0",
+    "pillow>=11.1.0,<12.3.0",
+    "pillow-heif>=1.0.0,<1.1.0",
     "piexif>=1.1.3,<2.0.0",
 ]
 
@@ -29,6 +30,9 @@ dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.7.0",
+]
+spk = [
+    "pyinstaller>=6.10.0,<7.0.0",
 ]
 
 [project.scripts]

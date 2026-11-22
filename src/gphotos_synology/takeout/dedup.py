@@ -10,6 +10,14 @@ from pathlib import Path
 
 from PIL import Image, ImageFilter, ImageOps, ImageStat
 
+try:
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    HEIF_SUPPORTED = True
+except Exception:  # pragma: no cover - optional if libheif unavailable
+    HEIF_SUPPORTED = False
+
 from gphotos_synology.takeout.extractor import compute_file_sha256
 from gphotos_synology.takeout.matcher import is_video_file
 
@@ -41,6 +49,7 @@ class MediaFingerprint:
     sharpness: float = 0.0
     quality_score: float = 0.0
     exif_taken_at: str | None = None
+    visual_status: str = ""  # "ok" | "undecodable" | "skipped" | ""
 
 
 @dataclass
@@ -212,7 +221,8 @@ def compare_image_quality(
             existing_score=ext_score,
         )
 
-    # 3. Comparable resolution & sharpness: prefer lossless or significantly richer compression (>= 15% larger)
+    # 3. Comparable resolution & sharpness: prefer lossless or richer compression (>= 15% larger)
+    #    guarded by non-inferior sharpness so metadata bloat doesn't beat a sharper image.
     if incoming.is_lossless and not existing.is_lossless:
         return QualityDecision(
             incoming_wins=True,
@@ -221,7 +231,10 @@ def compare_image_quality(
             existing_score=ext_score,
         )
 
-    if existing.file_size > 0 and incoming.file_size >= existing.file_size * 1.15:
+    non_inferior_sharpness = (
+        existing.sharpness <= 0 or incoming.sharpness >= existing.sharpness * 0.95
+    )
+    if existing.file_size > 0 and incoming.file_size >= existing.file_size * 1.15 and non_inferior_sharpness:
         inc_mb = incoming.file_size / (1024 * 1024)
         ext_mb = existing.file_size / (1024 * 1024)
         return QualityDecision(
@@ -243,7 +256,7 @@ def compute_media_fingerprint(path: Path, *, compute_visual: bool = True) -> Med
     """Compute SHA-256 plus decoded-pixel SHA-256, 128-bit perceptual hash, and clarity metrics."""
     file_sha256 = compute_file_sha256(path)
     if not compute_visual or is_video_file(path):
-        return MediaFingerprint(sha256=file_sha256)
+        return MediaFingerprint(sha256=file_sha256, visual_status="skipped")
 
     pixel_sha256 = ""
     dhash = ""
@@ -252,6 +265,7 @@ def compute_media_fingerprint(path: Path, *, compute_visual: bool = True) -> Med
     sharpness = 0.0
     quality_score = 0.0
     exif_taken_at: str | None = None
+    visual_status = "undecodable"
 
     try:
         file_size = path.stat().st_size
@@ -294,8 +308,10 @@ def compute_media_fingerprint(path: Path, *, compute_visual: bool = True) -> Med
                     filename=path.name,
                 )
             )
+            visual_status = "ok"
     except Exception as exc:
-        logger.debug("Visual fingerprint unavailable for %s: %s", path.name, exc)
+        logger.warning("Visual fingerprint unavailable for %s: %s", path.name, exc)
+        visual_status = "undecodable"
 
     return MediaFingerprint(
         sha256=file_sha256,
@@ -306,6 +322,7 @@ def compute_media_fingerprint(path: Path, *, compute_visual: bool = True) -> Med
         sharpness=sharpness,
         quality_score=quality_score,
         exif_taken_at=exif_taken_at,
+        visual_status=visual_status,
     )
 
 
@@ -323,27 +340,33 @@ def hamming_distance_hex(hash_a: str, hash_b: str) -> int:
         return 128
 
 
-def _aspect_ratios_compatible(w1: int, h1: int, w2: int, h2: int, max_rel_diff: float = 0.08) -> bool:
+def _aspect_ratios_compatible(w1: int, h1: int, w2: int, h2: int, max_rel_diff: float = 0.08) -> bool | None:
+    """Return True if compatible, False if incompatible, None if any dimension is unknown."""
     if w1 <= 0 or h1 <= 0 or w2 <= 0 or h2 <= 0:
-        return True
+        return None
     r1 = w1 / h1
     r2 = w2 / h2
     return abs(r1 - r2) / max(r1, r2) <= max_rel_diff
 
 
-def _timestamps_close(iso_a: str | None, iso_b: str | None, max_delta_seconds: int = 15) -> bool | None:
-    if not iso_a or not iso_b:
+def _parse_iso_utc(iso_str: str | None) -> datetime | None:
+    if not iso_str:
         return None
     try:
-        dt_a = datetime.fromisoformat(iso_a)
-        dt_b = datetime.fromisoformat(iso_b)
-        if dt_a.tzinfo is None:
-            dt_a = dt_a.replace(tzinfo=UTC)
-        if dt_b.tzinfo is None:
-            dt_b = dt_b.replace(tzinfo=UTC)
-        return abs((dt_a - dt_b).total_seconds()) <= max_delta_seconds
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
     except ValueError:
         return None
+
+
+def _timestamps_close(iso_a: str | None, iso_b: str | None, max_delta_seconds: int = 15) -> bool | None:
+    dt_a = _parse_iso_utc(iso_a)
+    dt_b = _parse_iso_utc(iso_b)
+    if dt_a is None or dt_b is None:
+        return None
+    return abs((dt_a - dt_b).total_seconds()) <= max_delta_seconds
 
 
 def is_perceptual_match(
@@ -363,35 +386,42 @@ def is_perceptual_match(
     """Guardrail-protected visual similarity match across resolutions and compression levels.
 
     Uses 128-bit dHash+vHash distance, aspect-ratio compatibility, and capture-time /
-    filename confirmation to match the same photo even when file hashes differ completely.
+    filename corroboration to avoid false positives on burst shots or similar scenes.
     """
-    if not _aspect_ratios_compatible(incoming_width, incoming_height, existing_width, existing_height):
+    ar_compat = _aspect_ratios_compatible(incoming_width, incoming_height, existing_width, existing_height)
+    if ar_compat is False:
         return False
+    dims_known = ar_compat is True
 
     # Scale threshold cleanly if comparing legacy 64-bit hashes vs 128-bit hashes
     effective_len = min(len(incoming_dhash), len(existing_dhash))
     effective_max = max_distance if effective_len == 32 else max(2, max_distance // 2)
+    strict_uncorroborated_max = 4 if effective_len == 32 else 2
 
     dist = hamming_distance_hex(incoming_dhash, existing_dhash)
     if dist > effective_max:
         return False
 
+    same_stem = Path(incoming_filename).stem.lower() == Path(existing_filename).stem.lower()
+
     # If both files have capture timestamps, confirm they match closely (allowing timezone shifts)
     ts_close = _timestamps_close(incoming_taken_at, existing_taken_at, max_delta_seconds=15)
     if ts_close is True:
-        return True
+        return dims_known or dist <= strict_uncorroborated_max
     if ts_close is False:
-        try:
-            dt_a = datetime.fromisoformat(incoming_taken_at or "")
-            dt_b = datetime.fromisoformat(existing_taken_at or "")
-            diff_s = abs((dt_a.replace(tzinfo=UTC) - dt_b.replace(tzinfo=UTC)).total_seconds())
+        dt_a = _parse_iso_utc(incoming_taken_at)
+        dt_b = _parse_iso_utc(existing_taken_at)
+        if dt_a is not None and dt_b is not None:
+            diff_s = abs((dt_a - dt_b).total_seconds())
             same_minute_sec = (diff_s % 3600) <= 15 or (3600 - (diff_s % 3600)) <= 15
-            if diff_s <= 14 * 3600 + 15 and same_minute_sec:
+            if diff_s <= 14 * 3600 + 15 and same_minute_sec and dims_known:
                 return True
-        except ValueError:
-            pass
-        # Allow a match across missing/wrong timestamp ONLY if visual distance is near-identical
-        return dist <= max(2, effective_max // 3)
+        # Conflicting timestamps: only match if visual distance is near-identical AND dimensions are known
+        return dims_known and dist <= max(2, min(strict_uncorroborated_max, effective_max // 3))
 
-    same_stem = Path(incoming_filename).stem.lower() == Path(existing_filename).stem.lower()
-    return same_stem or dist <= max(4, effective_max // 2)
+    # One or both timestamps missing:
+    # - Distance > 4 ALWAYS requires same filename stem AND known compatible dimensions.
+    # - Distance <= 4 requires known compatible dimensions OR same filename stem.
+    if dist > strict_uncorroborated_max:
+        return same_stem and dims_known
+    return dims_known or same_stem

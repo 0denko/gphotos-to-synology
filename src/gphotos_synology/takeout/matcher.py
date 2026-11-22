@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 MEDIA_EXTENSIONS: set[str] = {
@@ -141,19 +141,25 @@ class DirectoryJsonIndex:
     directory: Path
     by_name_lower: dict[str, Path]
     by_title_lower: dict[str, list[Path]]
+    by_name_exact: dict[str, Path] = field(default_factory=dict)
+    by_name_lower_all: dict[str, list[Path]] = field(default_factory=dict)
 
     @classmethod
     def build(cls, directory: Path) -> DirectoryJsonIndex:
+        by_name_exact: dict[str, Path] = {}
         by_name_lower: dict[str, Path] = {}
+        by_name_lower_all: dict[str, list[Path]] = {}
         by_title_lower: dict[str, list[Path]] = {}
 
-        for entry in directory.iterdir():
+        for entry in sorted(directory.iterdir(), key=lambda p: p.name):
             if not entry.is_file() or entry.suffix.lower() != ".json":
                 continue
             name_lower = entry.name.lower()
             if name_lower == "metadata.json":
                 continue
-            by_name_lower[name_lower] = entry
+            by_name_exact[entry.name] = entry
+            by_name_lower.setdefault(name_lower, entry)
+            by_name_lower_all.setdefault(name_lower, []).append(entry)
 
             # Read internal "title" field for fallback matching (fast on small JSON sidecars)
             try:
@@ -165,11 +171,31 @@ class DirectoryJsonIndex:
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 continue
 
-        return cls(directory=directory, by_name_lower=by_name_lower, by_title_lower=by_title_lower)
+        return cls(
+            directory=directory,
+            by_name_lower=by_name_lower,
+            by_title_lower=by_title_lower,
+            by_name_exact=by_name_exact,
+            by_name_lower_all=by_name_lower_all,
+        )
+
+    def lookup_name(self, candidate: str) -> Path | None:
+        exact = self.by_name_exact.get(candidate)
+        if exact is not None:
+            return exact
+        matches = self.by_name_lower_all.get(candidate.lower())
+        if matches and len(matches) == 1:
+            return matches[0]
+        return self.by_name_lower.get(candidate.lower()) if not matches else None
 
 
-def _candidate_json_names(filename: str) -> list[str]:
-    """Generate ordered candidate JSON sidecar filenames for a given media filename."""
+def _candidate_json_names(filename: str, *, include_stem_only: bool = False) -> list[str]:
+    """Generate ordered candidate JSON sidecar filenames for a given media filename.
+
+    Deliberately does NOT fall back from a numbered duplicate `IMG_1234(1).JPG`
+    to the unnumbered `IMG_1234.JPG.json` sidecar (prevents attaching another photo's
+    capture date/GPS to a distinct file that merely collided on name).
+    """
     candidates: list[str] = []
     seen: set[str] = set()
 
@@ -206,9 +232,6 @@ def _candidate_json_names(filename: str) -> list[str]:
         # Sometimes Google truncates base+ext to 46 chars before (N).json
         if len(unnumbered) > 46:
             add(f"{unnumbered[:46]}({num}).json")
-        # Also allow fallback to unnumbered sidecar if numbered sidecar is absent
-        add(f"{unnumbered}.json")
-        add(f"{unnumbered}{SUPPLEMENTAL_FULL}.json")
 
     # 4. 46-character filename truncation rule used by Google Takeout
     if len(filename) > 46:
@@ -217,68 +240,84 @@ def _candidate_json_names(filename: str) -> list[str]:
         for trunc_len in range(len(SUPPLEMENTAL_FULL), 0, -1):
             add(f"{truncated}{SUPPLEMENTAL_FULL[:trunc_len]}.json")
 
-    # 5. Strip extension quirk (rarely Takeout outputs <stem>.json without extension)
-    add(f"{stem}.json")
-    add(f"{stem}{SUPPLEMENTAL_FULL}.json")
+    # 5. Strip extension quirk (only attempted after title disambiguation)
+    if include_stem_only:
+        add(f"{stem}.json")
+        add(f"{stem}{SUPPLEMENTAL_FULL}.json")
 
     return candidates
 
 
 def find_sidecar_json(media_path: Path, index: DirectoryJsonIndex | None = None) -> Path | None:
-    """Locate the matching Google Takeout JSON sidecar for `media_path`, if any."""
+    """Locate the matching Google Takeout JSON sidecar for `media_path`, if any.
+
+    Bails out to `None` on ambiguous matches rather than attaching a wrong sidecar.
+    """
     idx = index or DirectoryJsonIndex.build(media_path.parent)
     filename = media_path.name
     stem = media_path.stem
     ext = media_path.suffix
 
-    # Direct candidate search
-    for candidate in _candidate_json_names(filename):
-        match = idx.by_name_lower.get(candidate.lower())
+    # 1. Direct candidate search (exact, supplemental-metadata, numbered duplicate, 46-char truncation)
+    for candidate in _candidate_json_names(filename, include_stem_only=False):
+        match = idx.lookup_name(candidate)
         if match is not None:
             return match
 
-    # Edited file fallback: IMG_1234-edited.JPG -> look up IMG_1234.JPG
+    # 2. Edited file fallback: IMG_1234-edited.JPG -> look up IMG_1234.JPG
     cleaned_stem = EDITED_SUFFIX_RE.sub("", stem)
     if cleaned_stem != stem:
         unedited_name = f"{cleaned_stem}{ext}"
-        for candidate in _candidate_json_names(unedited_name):
-            match = idx.by_name_lower.get(candidate.lower())
+        for candidate in _candidate_json_names(unedited_name, include_stem_only=False):
+            match = idx.lookup_name(candidate)
             if match is not None:
                 return match
 
-    # Live Photo companion video fallback: IMG_1234.MP4 / .MOV -> IMG_1234.HEIC.json / .JPG.json
+    # 3. Live Photo companion video fallback: IMG_1234.MP4 / .MOV -> IMG_1234.HEIC.json / .JPG.json
     if ext.lower() in {".mp4", ".mov"}:
         for still_ext in LIVE_PHOTO_STILL_EXTS:
-            for candidate in _candidate_json_names(f"{cleaned_stem}{still_ext}"):
-                match = idx.by_name_lower.get(candidate.lower())
+            for candidate in _candidate_json_names(f"{cleaned_stem}{still_ext}", include_stem_only=False):
+                match = idx.lookup_name(candidate)
                 if match is not None:
                     return match
 
-    # Title-based fallback: match JSON internal "title" == media filename (or unedited/unnumbered name)
-    title_candidates = [filename.lower()]
+    # 4. Title-based fallback: match JSON internal "title" (requires unambiguous candidate)
+    dup_match = DUPLICATE_NUM_RE.match(stem)
+    title_candidates: list[str] = [filename.lower()]
     if cleaned_stem != stem:
         title_candidates.append(f"{cleaned_stem}{ext}".lower())
-    dup_match = DUPLICATE_NUM_RE.match(stem)
-    if dup_match:
-        title_candidates.append(f"{dup_match.group('base')}{ext}".lower())
 
     for title_key in title_candidates:
         matches = idx.by_title_lower.get(title_key)
-        if matches:
-            # If numbered duplicate, prefer a sidecar containing (N) in its filename
-            if dup_match:
-                num_token = f"({dup_match.group('num')})"
-                for m in matches:
-                    if num_token in m.name:
-                        return m
+        if matches and len(matches) == 1:
             return matches[0]
 
-    # Prefix match fallback for severely truncated supplemental-metadata filenames
-    # e.g. very_long_filename_here_1234567890.jpg -> very_long_filename_here_1234567890.jpg.su.json
+    # For numbered duplicates (IMG_1234(1).JPG), only accept a sidecar with matching (N) token
+    if dup_match:
+        unnumbered_key = f"{dup_match.group('base')}{ext}".lower()
+        num_token = f"({dup_match.group('num')})"
+        matches = idx.by_title_lower.get(unnumbered_key) or []
+        numbered_matches = [m for m in matches if num_token in m.name]
+        if len(numbered_matches) == 1:
+            return numbered_matches[0]
+        # Never fall back to unnumbered sidecar for (N) duplicates
+        return None
+
+    # 5. Strip-extension quirk (<stem>.json) — only after title disambiguation
+    for candidate in (f"{stem}.json", f"{stem}{SUPPLEMENTAL_FULL}.json"):
+        match = idx.lookup_name(candidate)
+        if match is not None:
+            return match
+
+    # 6. Prefix match fallback for severely truncated supplemental-metadata filenames
+    #    Only return when a SINGLE unique sidecar matches the 46-char prefix.
     prefix_key = filename[:46].lower()
     if len(prefix_key) >= 35:
-        for json_name, json_path in idx.by_name_lower.items():
+        prefix_matches: list[Path] = []
+        for json_name, json_paths in idx.by_name_lower_all.items():
             if json_name.startswith(prefix_key):
-                return json_path
+                prefix_matches.extend(json_paths)
+        if len(prefix_matches) == 1:
+            return prefix_matches[0]
 
     return None

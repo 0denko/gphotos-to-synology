@@ -1,0 +1,21 @@
+# Sub-Orchestrator Briefing — M1 (`sub_orch_m1_gen2`)
+
+- **Role:** Milestone Sub-Orchestrator for M1 — Foundation (Dependencies, Version, Config & Database)
+- **Parent Conversation ID:** `c8b19b05da9e071b01096e473f316cf4`
+- **Own Conversation ID:** `645f581a2823278930b5dd011557c86b`
+- **State Folder:** `/home/antigravity/gphotos-to-synology/.agents/teamwork/sub_orch_m1_gen2`
+- **Spawn count:** 5 / 20
+- **Current Iteration:** 1 (Step 2B.c, d, e — Parallel Verification Wave)
+- **Prior Completed Artifacts:**
+  - Explorer 1: `/home/antigravity/gphotos-to-synology/.agents/teamwork/explorer_m1_r1_1/handoff.md`
+  - Explorer 2: `/home/antigravity/gphotos-to-synology/.agents/teamwork/explorer_m1_r1_2/handoff.md`
+  - Explorer 3: `/home/antigravity/gphotos-to-synology/.agents/teamwork/explorer_m1_r1_3/handoff.md`
+  - Worker 1: `/home/antigravity/gphotos-to-synology/.agents/teamwork/worker_m1_r1/handoff.md`
+- **Exclusive M1 File Scope:**
+  - `pyproject.toml`
+  - `uv.lock`
+  - `src/gphotos_synology/__init__.py`
+  - `src/gphotos_synology/config.py`
+  - `src/gphotos_synology/database.py`
+  - `tests/test_config.py`
+  - `tests/test_database.py`

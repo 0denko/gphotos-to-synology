@@ -83,11 +83,18 @@ class ExistingLibraryScanner:
             try:
                 stat = full_path.stat()
                 existing_meta = indexed_by_path.get(rel_posix)
+                visual_stable = (
+                    existing_meta is not None
+                    and (
+                        existing_meta["has_visual"]
+                        or existing_meta.get("visual_status") == "undecodable"
+                    )
+                )
                 if (
                     existing_meta is not None
                     and existing_meta["file_size"] == stat.st_size
                     and existing_meta["file_mtime_ns"] == stat.st_mtime_ns
-                    and (not compute_visual or existing_meta["has_visual"] or not self._is_image(full_path))
+                    and (not compute_visual or visual_stable or not self._is_image(full_path))
                 ):
                     result.unchanged_skipped += 1
                     continue
@@ -106,6 +113,7 @@ class ExistingLibraryScanner:
                     file_size=stat.st_size,
                     file_mtime_ns=stat.st_mtime_ns,
                     taken_at=fp.exif_taken_at,
+                    visual_status=fp.visual_status,
                 )
                 result.newly_indexed += 1
             except Exception as exc:

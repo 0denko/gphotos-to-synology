@@ -1,4 +1,4 @@
-"""Google Takeout JSON metadata parser and ExifTool metadata writer."""
+"""Google Takeout JSON metadata parser and ExifTool / piexif metadata writer."""
 
 from __future__ import annotations
 
@@ -41,7 +41,10 @@ def _parse_timestamp(value: object) -> datetime | None:
     if value is None:
         return None
     try:
-        ts = int(str(value).strip())
+        raw = str(value).strip()
+        if not raw:
+            return None
+        ts = int(float(raw))
         if ts <= 0:
             return None
         return datetime.fromtimestamp(ts, tz=UTC)
@@ -117,29 +120,57 @@ def _deg_to_dms_rational(deg: float) -> tuple[tuple[int, int], tuple[int, int], 
     m_float = (abs_deg - d) * 60.0
     m = int(m_float)
     s = round((m_float - m) * 60.0 * 10000)
+    if s >= 600000:
+        s = 0
+        m += 1
+    if m >= 60:
+        m = 0
+        d += 1
     return ((d, 1), (m, 1), (s, 10000))
 
 
 def _apply_piexif_jpeg(media_path: Path, metadata: PhotoMetadata) -> bool:
-    """Pure-Python EXIF/GPS writer fallback for JPEGs when ExifTool isn't available."""
+    """Pure-Python EXIF/GPS writer fallback for JPEGs when ExifTool isn't available.
+
+    If `piexif.load()` fails on an existing JPEG (e.g., malformed maker notes),
+    returns False instead of replacing the existing EXIF segment with an empty dict.
+    """
     if media_path.suffix.lower() not in {".jpg", ".jpeg"}:
         return False
     try:
         import piexif
+        from piexif import helper as piexif_helper
 
         try:
             exif_dict = piexif.load(str(media_path))
-        except Exception:
-            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+        except Exception as exc:
+            logger.warning(
+                "Skipping piexif write for %s to preserve unparseable existing EXIF: %s",
+                media_path.name,
+                exc,
+            )
+            return False
 
         if metadata.taken_at is not None:
-            dt_bytes = metadata.taken_at.strftime("%Y:%m:%d %H:%M:%S").encode("ascii")
+            dt_utc = metadata.taken_at.astimezone(UTC)
+            dt_bytes = dt_utc.strftime("%Y:%m:%d %H:%M:%S").encode("ascii")
             exif_dict["0th"][piexif.ImageIFD.DateTime] = dt_bytes
             exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = dt_bytes
             exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = dt_bytes
+            # EXIF 2.31 OffsetTime tags (36880, 36881, 36882) declare UTC (+00:00)
+            exif_dict["Exif"][36880] = b"+00:00"
+            exif_dict["Exif"][36881] = b"+00:00"
+            exif_dict["Exif"][36882] = b"+00:00"
 
         if metadata.description:
-            exif_dict["0th"][piexif.ImageIFD.ImageDescription] = metadata.description.encode("utf-8")
+            try:
+                ascii_desc = metadata.description.encode("ascii")
+                exif_dict["0th"][piexif.ImageIFD.ImageDescription] = ascii_desc
+            except UnicodeEncodeError:
+                # EXIF ImageDescription is ASCII-only; store UTF-8/Unicode in ExifIFD.UserComment
+                exif_dict["Exif"][piexif.ExifIFD.UserComment] = piexif_helper.UserComment.dump(
+                    metadata.description, encoding="unicode"
+                )
 
         if metadata.has_gps and metadata.latitude is not None and metadata.longitude is not None:
             exif_dict["GPS"][piexif.GPSIFD.GPSLatitudeRef] = b"N" if metadata.latitude >= 0 else b"S"
@@ -154,7 +185,7 @@ def _apply_piexif_jpeg(media_path: Path, metadata: PhotoMetadata) -> bool:
         piexif.insert(exif_bytes, str(media_path))
         return True
     except Exception as exc:
-        logger.debug("piexif fallback failed for %s: %s", media_path.name, exc)
+        logger.warning("piexif fallback failed for %s: %s", media_path.name, exc)
         return False
 
 
@@ -185,6 +216,11 @@ def apply_metadata(
 
     if not exiftool_available(exiftool_path):
         repaired_py = _apply_piexif_jpeg(media_path, metadata)
+        if not repaired_py and media_path.suffix.lower() not in {".jpg", ".jpeg"}:
+            logger.warning(
+                "ExifTool unavailable; falling back to mtime_only for non-JPEG %s",
+                media_path.name,
+            )
         _apply_file_mtime(media_path, metadata.taken_at)
         return "repaired" if repaired_py else "mtime_only"
 
@@ -201,8 +237,9 @@ def apply_metadata(
     is_video = is_video_file(media_path)
 
     if metadata.taken_at is not None:
-        exif_dt = metadata.taken_at.strftime("%Y:%m:%d %H:%M:%S")
-        iso_dt = metadata.taken_at.strftime("%Y:%m:%d %H:%M:%S+00:00")
+        dt_utc = metadata.taken_at.astimezone(UTC)
+        exif_dt = dt_utc.strftime("%Y:%m:%d %H:%M:%S")
+        iso_dt = dt_utc.strftime("%Y:%m:%d %H:%M:%S+00:00")
         if is_video:
             args.extend(
                 [
@@ -219,6 +256,9 @@ def apply_metadata(
                     f"-EXIF:DateTimeOriginal={exif_dt}",
                     f"-EXIF:CreateDate={exif_dt}",
                     f"-EXIF:ModifyDate={exif_dt}",
+                    "-EXIF:OffsetTimeOriginal=+00:00",
+                    "-EXIF:OffsetTimeDigitized=+00:00",
+                    "-EXIF:OffsetTime=+00:00",
                     f"-XMP:DateCreated={iso_dt}",
                 ]
             )

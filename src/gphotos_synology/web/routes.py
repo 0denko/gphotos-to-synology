@@ -1,13 +1,17 @@
-"""FastAPI REST endpoints, multi-user profile management, and Google OAuth2 handlers."""
+"""FastAPI REST endpoints, multi-user profile management, auth session, and Google OAuth2 handlers."""
 
 from __future__ import annotations
 
+import hmac
 import io
+import json
 import secrets
+import time
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
@@ -18,10 +22,23 @@ from gphotos_synology.sources.gdrive import GoogleDriveClient
 from gphotos_synology.synology.photos_api import SynologyPhotosClient
 from gphotos_synology.takeout.extractor import get_free_disk_gb
 from gphotos_synology.takeout.metadata import exiftool_available
+from gphotos_synology.web.security import (
+    SESSION_COOKIE_NAME,
+    assert_admin,
+    assert_profile_access,
+    get_identity,
+    load_proxy_secret,
+)
+
+OAUTH_STATE_TTL_SECONDS = 600
 
 
 class SettingsUpdateRequest(BaseModel):
     updates: dict[str, Any]
+
+
+class AuthSessionRequest(BaseModel):
+    token: str
 
 
 def create_api_router() -> APIRouter:
@@ -31,11 +48,76 @@ def create_api_router() -> APIRouter:
         return request.app.state.ctx
 
     def _profile_ctx(request: Request, profile: str | None = None) -> ProfileContext:
-        pid = profile or request.query_params.get("profile") or request.headers.get("x-profile-id") or "default"
+        app_ctx = _app_ctx(request)
+        identity = get_identity(request)
+        requested_pid = (
+            profile
+            or request.query_params.get("profile")
+            or request.headers.get("x-profile-id")
+            or ""
+        ).strip()
+
+        # C2: Non-admin DSM users default to their own DSM profile and cannot cross into others
+        if not requested_pid:
+            if identity.via_proxy and not identity.is_admin:
+                requested_pid = app_ctx.registry.resolve_profile_for_dsm_user(identity.dsm_user)
+            else:
+                requested_pid = "default"
+
         try:
-            return _app_ctx(request).registry.get_context(pid)
+            pctx = app_ctx.registry.get_context(requested_pid)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        assert_profile_access(identity, pctx.profile)
+        return pctx
+
+    # ------------------------------------------------------------------
+    # Authentication Session (Direct / Docker Mode)
+    # ------------------------------------------------------------------
+    @router.get("/auth/status")
+    def auth_status(request: Request) -> dict[str, Any]:
+        app_ctx = _app_ctx(request)
+        identity = get_identity(request)
+        settings = app_ctx.config_manager.settings
+        proxy_configured = bool(load_proxy_secret(settings))
+        auth_required = not (
+            settings.allow_insecure_no_auth and not proxy_configured and not settings.api_token.strip()
+        )
+        return {
+            "authenticated": identity.authenticated,
+            "auth_required": auth_required,
+            "via_proxy": identity.via_proxy,
+            "dsm_user": identity.dsm_user,
+            "is_admin": identity.is_admin,
+        }
+
+    @router.post("/auth/session")
+    def create_auth_session(request: Request, body: AuthSessionRequest) -> JSONResponse:
+        app_ctx = _app_ctx(request)
+        expected = app_ctx.effective_api_token
+        if not expected or not hmac.compare_digest(body.token.strip(), expected):
+            raise HTTPException(status_code=401, detail="Invalid API token")
+        is_secure = (
+            request.url.scheme == "https"
+            or request.headers.get("x-forwarded-proto", "").lower() == "https"
+        )
+        resp = JSONResponse({"ok": True})
+        resp.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=expected,
+            httponly=True,
+            samesite="strict",
+            secure=is_secure,
+            path="/",
+        )
+        return resp
+
+    @router.post("/auth/logout")
+    def clear_auth_session() -> JSONResponse:
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
+        return resp
 
     # ------------------------------------------------------------------
     # Multi-User Synology Profiles & Auto-Discovery
@@ -43,12 +125,21 @@ def create_api_router() -> APIRouter:
     @router.get("/profiles")
     def list_profiles(request: Request) -> dict[str, Any]:
         app_ctx = _app_ctx(request)
-        dsm_user = request.headers.get("x-dsm-user", "").strip()
-        discovery = app_ctx.registry.discover_synology_users()
-        recommended_id = app_ctx.registry.resolve_profile_for_dsm_user(dsm_user)
+        identity = get_identity(request)
+        dsm_user = identity.dsm_user
+        if identity.is_admin:
+            profiles = app_ctx.registry.list_profiles()
+            discovery = app_ctx.registry.discover_synology_users()
+            recommended_id = app_ctx.registry.resolve_profile_for_dsm_user(dsm_user)
+        else:
+            profiles = app_ctx.registry.list_profiles(dsm_user_filter=dsm_user)
+            discovery = app_ctx.registry.discover_synology_users(only_username=dsm_user)
+            recommended_id = profiles[0]["id"] if profiles else ""
         return {
-            "profiles": app_ctx.registry.list_profiles(),
+            "profiles": profiles,
+            "dsm_user": dsm_user,
             "current_dsm_user": dsm_user,
+            "is_admin": identity.is_admin,
             "recommended_profile_id": recommended_id,
             "homes_mounted": discovery["homes_mounted"],
             "discovered_synology_users": discovery["users"],
@@ -56,6 +147,7 @@ def create_api_router() -> APIRouter:
 
     @router.post("/profiles")
     def create_profile(request: Request, body: CreateProfileRequest) -> dict[str, Any]:
+        assert_admin(get_identity(request))
         app_ctx = _app_ctx(request)
         try:
             pctx = app_ctx.registry.create_profile(body)
@@ -70,6 +162,7 @@ def create_api_router() -> APIRouter:
 
     @router.patch("/profiles/{profile_id}")
     def update_profile(request: Request, profile_id: str, body: UpdateProfileRequest) -> dict[str, Any]:
+        assert_admin(get_identity(request))
         app_ctx = _app_ctx(request)
         try:
             updated = app_ctx.registry.update_profile(profile_id, body)
@@ -81,6 +174,7 @@ def create_api_router() -> APIRouter:
 
     @router.delete("/profiles/{profile_id}")
     def delete_profile(request: Request, profile_id: str) -> dict[str, Any]:
+        assert_admin(get_identity(request))
         app_ctx = _app_ctx(request)
         try:
             app_ctx.registry.delete_profile(profile_id)
@@ -113,6 +207,7 @@ def create_api_router() -> APIRouter:
         pctx = _profile_ctx(request, profile)
         settings = pctx.config_manager.settings
         gdrive = GoogleDriveClient(settings)
+        conn_status = gdrive.connection_status()
         return {
             "profile": pctx.profile.model_dump(mode="json"),
             "progress": pctx.pipeline.get_progress(),
@@ -120,7 +215,8 @@ def create_api_router() -> APIRouter:
             "worker_running": app_ctx.scheduler.is_running,
             "worker_paused": app_ctx.scheduler.is_paused,
             "gdrive_oauth_configured": gdrive.is_oauth_configured(),
-            "gdrive_connected": gdrive.is_connected(),
+            "gdrive_connected": conn_status["connected"],
+            "gdrive_auth_error": conn_status["error"],
             "exiftool_available": exiftool_available(settings.exiftool_path),
             "synology_api_enabled": settings.synology_api_enabled,
             "photos_dir_writable": settings.is_photos_dir_writable(),
@@ -221,6 +317,7 @@ def create_api_router() -> APIRouter:
 
     @router.post("/updates/apply")
     def apply_update(request: Request) -> dict[str, Any]:
+        assert_admin(get_identity(request))
         app_ctx = _app_ctx(request)
         try:
             res = app_ctx.updater.trigger_self_update(app_ctx.config_manager.settings)
@@ -249,8 +346,13 @@ def create_api_router() -> APIRouter:
             pctx.config_manager.update(body.updates)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        warnings = list(getattr(pctx.config_manager, "last_update_warnings", []))
         pctx.db.log_event("INFO", "config", "Updated runtime configuration from dashboard")
-        return {"ok": True, "settings": pctx.config_manager.to_public_dict()}
+        return {
+            "ok": True,
+            "settings": pctx.config_manager.to_public_dict(),
+            "warnings": warnings,
+        }
 
     # ------------------------------------------------------------------
     # Worker & Maintenance Actions
@@ -294,11 +396,13 @@ def create_api_router() -> APIRouter:
 
     @router.post("/actions/pause")
     def pause_worker(request: Request) -> dict[str, Any]:
+        assert_admin(get_identity(request))
         _app_ctx(request).scheduler.pause()
         return {"ok": True, "worker_paused": True}
 
     @router.post("/actions/resume")
     def resume_worker(request: Request) -> dict[str, Any]:
+        assert_admin(get_identity(request))
         _app_ctx(request).scheduler.resume()
         return {"ok": True, "worker_paused": False}
 
@@ -344,35 +448,59 @@ def create_api_router() -> APIRouter:
         return {"ok": True}
 
     # ------------------------------------------------------------------
-    # Per-Profile Google Drive OAuth2 Flow
+    # Per-Profile Google Drive OAuth2 Flow (G3 Fail-Closed)
     # ------------------------------------------------------------------
+    def _trust_forwarded(request: Request) -> bool:
+        identity = get_identity(request)
+        if identity.via_proxy:
+            return True
+        return bool(_app_ctx(request).config_manager.settings.trust_proxy_headers)
+
     def _public_base_url(request: Request) -> str:
-        proto = request.headers.get("x-forwarded-proto")
-        host = request.headers.get("x-forwarded-host")
-        prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")
-        if proto and host:
-            return f"{proto}://{host}{prefix}"
-        return str(request.base_url).rstrip("/") + prefix
+        if _trust_forwarded(request):
+            proto = request.headers.get("x-forwarded-proto")
+            host = request.headers.get("x-forwarded-host")
+            prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")
+            if proto and host:
+                return f"{proto}://{host}{prefix}"
+            return str(request.base_url).rstrip("/") + prefix
+        return str(request.base_url).rstrip("/")
+
+    def _is_cgi_proxy(request: Request) -> bool:
+        return _trust_forwarded(request) and request.headers.get("x-proxy-mode") == "cgi"
 
     def _resolve_redirect_uri(request: Request, pctx: ProfileContext) -> str:
         settings = pctx.config_manager.settings
         if settings.google_redirect_uri.strip():
             return settings.google_redirect_uri.strip()
-        if request.headers.get("x-proxy-mode") == "cgi":
+        if _is_cgi_proxy(request):
             return f"{_public_base_url(request)}/oauth_callback.cgi"
         return f"{_public_base_url(request)}/api/oauth/google/callback"
 
     @router.get("/oauth/google/start")
     def google_oauth_start(request: Request, profile: str | None = None) -> dict[str, Any]:
+        app_ctx = _app_ctx(request)
+        identity = get_identity(request)
         pctx = _profile_ctx(request, profile)
         gdrive = GoogleDriveClient(pctx.config_manager.settings)
         redirect_uri = _resolve_redirect_uri(request, pctx)
-        # Encode profile_id in OAuth state so callback routes token to the exact user profile
-        state = f"{pctx.profile.id}:{secrets.token_urlsafe(24)}"
-        pctx.db.set_state("oauth_state", state)
+
+        # G3: Opaque server-side OAuth state token stored with TTL, profile_id, redirect_uri, and caller user
+        state_token = secrets.token_urlsafe(32)
+        state_record = json.dumps(
+            {
+                "state": state_token,
+                "profile_id": pctx.profile.id,
+                "redirect_uri": redirect_uri,
+                "dsm_user": identity.dsm_user,
+                "created_at": time.time(),
+            }
+        )
+        app_ctx.db.set_state(f"oauth_state:{state_token}", state_record)
         try:
-            auth_url, _ = gdrive.build_authorization_url(redirect_uri=redirect_uri, state=state)
+            auth_url, _ = gdrive.build_authorization_url(redirect_uri=redirect_uri, state=state_token)
         except Exception as exc:
+            app_ctx.db.delete_state(f"oauth_state:{state_token}")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"authorization_url": auth_url, "redirect_uri": redirect_uri}
 
@@ -384,43 +512,78 @@ def create_api_router() -> APIRouter:
         error: str | None = None,
     ) -> RedirectResponse:
         app_ctx = _app_ctx(request)
-        base_prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")
-        if request.headers.get("x-proxy-mode") == "cgi":
-            home_url = f"{base_prefix}/proxy.cgi"
-        else:
-            home_url = f"{base_prefix}/"
+        identity = get_identity(request)
+        base_prefix = (
+            request.headers.get("x-forwarded-prefix", "").rstrip("/")
+            if _trust_forwarded(request)
+            else ""
+        )
+        home_url = f"{base_prefix}/proxy.cgi" if _is_cgi_proxy(request) else f"{base_prefix}/"
 
-        profile_id = "default"
-        if state and ":" in state:
-            profile_id = state.split(":", 1)[0] or "default"
+        # G3: Fail closed — state MUST match a live, unexpired server-side record
+        state_key = f"oauth_state:{state}" if state else ""
+        raw_record = app_ctx.db.get_state(state_key) if state_key else None
+
+        if not state or not raw_record:
+            app_ctx.db.log_event("ERROR", "oauth", "Google OAuth callback rejected: missing or unknown state")
+            return RedirectResponse(url=f"{home_url}?oauth=error&detail=state_mismatch", status_code=302)
+
+        try:
+            rec = json.loads(raw_record)
+            stored_state = str(rec.get("state") or "")
+            profile_id = str(rec.get("profile_id") or "")
+            bound_redirect_uri = str(rec.get("redirect_uri") or "")
+            bound_dsm_user = str(rec.get("dsm_user") or "")
+            created_at = float(rec.get("created_at") or 0.0)
+        except (ValueError, TypeError):
+            app_ctx.db.delete_state(state_key)
+            return RedirectResponse(url=f"{home_url}?oauth=error&detail=state_mismatch", status_code=302)
+
+        if not hmac.compare_digest(state, stored_state) or (time.time() - created_at) > OAUTH_STATE_TTL_SECONDS:
+            app_ctx.db.delete_state(state_key)
+            app_ctx.db.log_event("ERROR", "oauth", "Google OAuth callback rejected: expired or mismatched state")
+            return RedirectResponse(url=f"{home_url}?oauth=error&detail=state_mismatch", status_code=302)
+
+        # C2 + G3: In proxied mode, verify callback user matches the user who started OAuth
+        # BEFORE consuming state_key so another user cannot DoS a victim's in-flight OAuth state
+        if identity.via_proxy and bound_dsm_user and bound_dsm_user.lower() != identity.dsm_user.lower():
+            app_ctx.db.log_event("ERROR", "oauth", "Google OAuth callback rejected: DSM user mismatch")
+            return RedirectResponse(url=f"{home_url}?oauth=error&detail=state_mismatch", status_code=302)
+
         try:
             pctx = app_ctx.registry.get_context(profile_id)
-        except KeyError:
-            pctx = app_ctx.registry.get_context("default")
-            profile_id = "default"
+            assert_profile_access(identity, pctx.profile)
+        except (KeyError, HTTPException):
+            return RedirectResponse(url=f"{home_url}?oauth=error&detail=profile_not_allowed", status_code=302)
 
+        # Consume verified state immediately (one-time use, prevents replay)
+        app_ctx.db.delete_state(state_key)
+
+        safe_pid = quote(profile_id, safe="")
         if error:
+            safe_err = quote(error, safe="")
             pctx.db.log_event("ERROR", "oauth", f"Google OAuth returned error: {error}")
-            return RedirectResponse(url=f"{home_url}?profile={profile_id}&oauth=error&detail={error}", status_code=302)
+            return RedirectResponse(
+                url=f"{home_url}?profile={safe_pid}&oauth=error&detail={safe_err}",
+                status_code=302,
+            )
         if not code:
-            return RedirectResponse(url=f"{home_url}?profile={profile_id}&oauth=error&detail=missing_code", status_code=302)
-
-        expected_state = pctx.db.get_state("oauth_state")
-        if expected_state and state != expected_state:
-            pctx.db.log_event("ERROR", "oauth", "Google OAuth state mismatch")
-            return RedirectResponse(url=f"{home_url}?profile={profile_id}&oauth=error&detail=state_mismatch", status_code=302)
+            return RedirectResponse(
+                url=f"{home_url}?profile={safe_pid}&oauth=error&detail=missing_code",
+                status_code=302,
+            )
 
         gdrive = GoogleDriveClient(pctx.config_manager.settings)
-        redirect_uri = _resolve_redirect_uri(request, pctx)
+        redirect_uri = bound_redirect_uri or _resolve_redirect_uri(request, pctx)
         try:
             gdrive.exchange_code(code=code, redirect_uri=redirect_uri)
             pctx.db.log_event("INFO", "oauth", f"Google Drive connected for '{pctx.profile.display_name}'")
             app_ctx.scheduler.trigger_now(profile_id=pctx.profile.id, albums_only=False)
-            return RedirectResponse(url=f"{home_url}?profile={profile_id}&oauth=success", status_code=302)
+            return RedirectResponse(url=f"{home_url}?profile={safe_pid}&oauth=success", status_code=302)
         except Exception as exc:
             pctx.db.log_event("ERROR", "oauth", f"OAuth token exchange failed: {exc}")
             return RedirectResponse(
-                url=f"{home_url}?profile={profile_id}&oauth=error&detail=token_exchange_failed",
+                url=f"{home_url}?profile={safe_pid}&oauth=error&detail=token_exchange_failed",
                 status_code=302,
             )
 

@@ -1,6 +1,7 @@
 .git
 .gitignore
 .venv
+.agents
 __pycache__
 *.pyc
 .pytest_cache
@@ -8,3 +9,7 @@ __pycache__
 tests
 .env
 data
+PROJECT.md
+TEST_INFRA.md
+TEST_READY.md
+Collab.md
