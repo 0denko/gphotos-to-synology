@@ -1,9 +1,10 @@
-"""GitHub update checker and Watchtower self-update trigger."""
+"""GitHub update checker (semver non-downgrading + .sha256) and Watchtower self-update trigger."""
 
 from __future__ import annotations
 
 import logging
 import platform
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -17,12 +18,35 @@ from gphotos_synology.config import Settings
 
 logger = logging.getLogger(__name__)
 
+_SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-.](\d+))?")
+
 
 def _host_spk_arch() -> str:
     machine = (platform.machine() or "").lower()
     if machine in {"aarch64", "arm64"}:
         return "arm64"
     return "x86_64"
+
+
+def _parse_semver(version: str) -> tuple[int, int, int, int] | None:
+    match = _SEMVER_RE.match((version or "").strip())
+    if not match:
+        return None
+    return (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3)),
+        int(match.group(4) or 0),
+    )
+
+
+def is_newer_version(latest: str, current: str) -> bool:
+    """Return True strictly when `latest` is a higher semantic version than `current`."""
+    latest_t = _parse_semver(latest)
+    current_t = _parse_semver(current)
+    if latest_t is None or current_t is None:
+        return False
+    return latest_t > current_t
 
 
 @dataclass
@@ -37,16 +61,18 @@ class UpdateStatus:
     update_available: bool = False
     release_url: str = ""
     spk_download_url: str = ""
+    spk_sha256_url: str = ""
     auto_updater_configured: bool = False
     checked_at: str | None = None
     error: str = ""
+    release_error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 class UpdateService:
-    """Checks GitHub for newer builds and triggers Watchtower self-updates on demand."""
+    """Checks GitHub Releases for strictly newer builds and triggers Watchtower self-updates."""
 
     def __init__(self, *, cache_ttl_seconds: int = 1800) -> None:
         self._lock = threading.Lock()
@@ -74,7 +100,6 @@ class UpdateService:
                 and self._cached is not None
                 and (now_mono - self._last_checked_mono) < self._cache_ttl
             ):
-                # Refresh auto_updater_configured dynamically from current settings
                 self._cached.auto_updater_configured = bool(
                     settings.watchtower_url.strip() and settings.watchtower_token.strip()
                 )
@@ -101,6 +126,7 @@ class UpdateService:
             build_date=settings.app_build_date.strip(),
             release_url=f"https://github.com/{repo}/releases/latest",
             spk_download_url=f"https://github.com/{repo}/releases/latest/download/gphotos-migrator-dsm7-{arch}.spk",
+            spk_sha256_url=f"https://github.com/{repo}/releases/latest/download/gphotos-migrator-dsm7-{arch}.spk.sha256",
             auto_updater_configured=bool(
                 settings.watchtower_url.strip() and settings.watchtower_token.strip()
             ),
@@ -119,20 +145,24 @@ class UpdateService:
             },
         )
         try:
-            # 1. Check latest commit on main (matches ghcr.io :latest builds)
+            # 1. Check latest commit on main (informational metadata)
             commit_resp = client.get(f"https://api.github.com/repos/{repo}/commits/main")
             commit_resp.raise_for_status()
             commit_data = commit_resp.json()
             full_latest_sha = str(commit_data.get("sha") or "")
             commit_obj = commit_data.get("commit") or {}
-            raw_msg = str(commit_obj.get("message") or "").splitlines()[0] if commit_obj.get("message") else ""
+            raw_msg = (
+                str(commit_obj.get("message") or "").splitlines()[0]
+                if commit_obj.get("message")
+                else ""
+            )
             commit_date = str((commit_obj.get("committer") or {}).get("date") or "")
 
             status.latest_sha = self._short_sha(full_latest_sha)
             status.latest_commit_message = raw_msg[:140]
             status.latest_commit_date = commit_date
 
-            # 2. Check latest GitHub release tag & architecture-matching SPK asset URL
+            # 2. Check latest GitHub release tag, SPK asset URL & .sha256 checksum URL
             try:
                 rel_resp = client.get(f"https://api.github.com/repos/{repo}/releases/latest")
                 if rel_resp.status_code == 200:
@@ -144,22 +174,30 @@ class UpdateService:
                     for asset in rel_data.get("assets") or []:
                         name = str(asset.get("name", ""))
                         dl_url = str(asset.get("browser_download_url") or "")
-                        if not (name.endswith(".spk") and dl_url):
+                        if not dl_url:
                             continue
-                        if f"-{arch}.spk" in name:
+                        if name.endswith(f"-{arch}.spk.sha256"):
+                            status.spk_sha256_url = dl_url
+                        elif name.endswith(f"-{arch}.spk"):
                             status.spk_download_url = dl_url
                             fallback_spk = ""
-                            break
-                        if not fallback_spk:
+                        elif name.endswith(".spk") and not fallback_spk:
                             fallback_spk = dl_url
-                    if fallback_spk:
+                    if fallback_spk and not status.spk_download_url:
                         status.spk_download_url = fallback_spk
-            except Exception:
-                pass
+                else:
+                    status.release_error = f"GitHub release check returned HTTP {rel_resp.status_code}"
+                    if not status.error:
+                        status.error = status.release_error
+            except Exception as exc:
+                status.release_error = f"Release check failed: {exc}"
+                if not status.error:
+                    status.error = status.release_error
+                logger.warning("GitHub release check failed: %s", exc)
 
-            # Determine if an update is available (compare SHAs when running a built image)
-            if full_latest_sha and current_sha and current_sha != "dev":
-                status.update_available = not full_latest_sha.lower().startswith(current_sha.lower())
+            # G7: Never report a downgrade as an update — require strictly newer semver when available
+            if status.latest_version:
+                status.update_available = is_newer_version(status.latest_version, __version__)
             else:
                 status.update_available = False
         except Exception as exc:
@@ -177,7 +215,7 @@ class UpdateService:
         *,
         http_client: httpx.Client | None = None,
     ) -> dict[str, Any]:
-        """Ask the scoped Watchtower companion container to pull the latest image and restart."""
+        """Ask the scoped Watchtower companion container via POST to pull the latest image and restart."""
         wt_url = settings.watchtower_url.strip().rstrip("/")
         wt_token = settings.watchtower_token.strip()
         if not wt_url or not wt_token:
@@ -191,8 +229,6 @@ class UpdateService:
         headers = {"Authorization": f"Bearer {wt_token}"}
         try:
             resp = client.post(f"{wt_url}/v1/update", params={"async": "1"}, headers=headers)
-            if resp.status_code == 405:
-                resp = client.get(f"{wt_url}/v1/update", headers=headers)
             resp.raise_for_status()
             return {
                 "ok": True,

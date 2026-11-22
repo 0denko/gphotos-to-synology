@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import threading
@@ -41,6 +42,19 @@ from gphotos_synology.takeout.metadata import PhotoMetadata, apply_metadata, par
 
 logger = logging.getLogger(__name__)
 
+_DISK_ALERT_THROTTLE_HOURS = 12
+
+
+def _resolve_contained(base_dir: Path, rel_or_name: str) -> Path:
+    """Resolve `base_dir / rel_or_name` and verify strict containment within `base_dir`."""
+    if not rel_or_name or rel_or_name.startswith(("/", "\\")):
+        raise ValueError(f"Invalid relative path: {rel_or_name!r}")
+    base = base_dir.resolve()
+    target = (base / rel_or_name).resolve()
+    if target != base and base not in target.parents:
+        raise ValueError(f"Path escapes base directory: {rel_or_name!r}")
+    return target
+
 
 @dataclass
 class PipelineProgress:
@@ -75,6 +89,7 @@ class MigrationPipeline:
         self.db = db
         self._synology_client_factory = synology_client_factory or SynologyPhotosClient
         self._progress_lock = threading.Lock()
+        self._op_lock = threading.RLock()
         self._progress = PipelineProgress()
         self._inbox_scanner = LocalInboxScanner(self.config_manager.settings)
 
@@ -104,9 +119,64 @@ class MigrationPipeline:
                 f"(min {settings.min_free_disk_gb:.2f} GB)"
             )
             self._log("WARNING", "disk-guard", msg)
-            Notifier(settings).send("Low Disk Space Guard Triggered", msg, level="error")
+            self._send_throttled_disk_alert(msg)
             return False
         return True
+
+    def _send_throttled_disk_alert(self, msg: str) -> None:
+        now = datetime.now(UTC)
+        last_raw = self.db.get_state("last_disk_alert_at")
+        if last_raw:
+            try:
+                last_dt = datetime.fromisoformat(last_raw)
+                if (now - last_dt) < timedelta(hours=_DISK_ALERT_THROTTLE_HOURS):
+                    return
+            except ValueError:
+                pass
+        Notifier(self.config_manager.settings).send_async(
+            "Low Disk Space Guard Triggered", msg, level="error"
+        )
+        self.db.set_state("last_disk_alert_at", utc_now_iso())
+
+    def recover_in_progress_upgrades(self) -> int:
+        """Recover any quality-upgrade swaps left `in_progress` by a crash or power loss (G2)."""
+        with self._op_lock:
+            settings = self.config_manager.settings
+            pending = self.db.list_in_progress_quality_upgrades()
+            recovered = 0
+            for row in pending:
+                upgrade_id = int(row["id"])
+                q_name = str(row.get("quarantine_filename") or "")
+                old_rel = str(row.get("old_rel_path") or "")
+                kept_rel = str(row.get("kept_rel_path") or "")
+                try:
+                    q_path = _resolve_contained(settings.quarantine_dir, q_name) if q_name else None
+                    old_abs = _resolve_contained(settings.photos_dir, old_rel) if old_rel else None
+                    kept_abs = _resolve_contained(settings.photos_dir, kept_rel) if kept_rel else None
+                except ValueError:
+                    self.db.delete_quality_upgrade(upgrade_id)
+                    recovered += 1
+                    continue
+
+                if q_path and q_path.is_file() and old_abs and not old_abs.is_file() and not (
+                    kept_abs and kept_abs.is_file()
+                ):
+                    # Original was moved to quarantine but incoming never landed — roll back safely
+                    safe_move_or_copy(q_path, old_abs)
+                    self.db.delete_quality_upgrade(upgrade_id)
+                    self._log(
+                        "WARNING",
+                        "quality-upgrade",
+                        f"Recovered interrupted upgrade #{upgrade_id}: restored {old_rel} from quarantine",
+                    )
+                    recovered += 1
+                elif kept_abs and kept_abs.is_file() and q_path and q_path.is_file():
+                    self.db.finalize_quality_upgrade(upgrade_id, kept_rel)
+                    recovered += 1
+                else:
+                    self.db.delete_quality_upgrade(upgrade_id)
+                    recovered += 1
+            return recovered
 
     def index_existing_library(self) -> dict[str, int]:
         """Incrementally index existing photos on Synology DSM so migrations never create duplicates."""
@@ -145,90 +215,100 @@ class MigrationPipeline:
 
     def run_cycle(self) -> dict[str, Any]:
         """Execute one complete indexing, polling, ingestion, and album-sync cycle."""
-        settings = self.config_manager.settings
-        self._inbox_scanner.settings = settings
-        summary = {
-            "existing_newly_indexed": 0,
-            "inbox_processed": 0,
-            "gdrive_processed": 0,
-            "albums_synced": 0,
-            "errors": 0,
-        }
+        with self._op_lock:
+            settings = self.config_manager.settings
+            self._inbox_scanner.settings = settings
+            summary = {
+                "existing_newly_indexed": 0,
+                "inbox_processed": 0,
+                "gdrive_processed": 0,
+                "albums_synced": 0,
+                "errors": 0,
+            }
 
-        self._set_progress(
-            state="scanning",
-            current_archive="",
-            current_step="Scanning existing NAS library, inbox, and Google Drive",
-            download_pct=0.0,
-            processed_files=0,
-            total_files=0,
-            last_error="",
-        )
+            self._set_progress(
+                state="scanning",
+                current_archive="",
+                current_step="Scanning existing NAS library, inbox, and Google Drive",
+                download_pct=0.0,
+                processed_files=0,
+                total_files=0,
+                last_error="",
+            )
 
-        try:
-            # 0. Incrementally index existing NAS photos before importing new Takeout archives
-            if settings.auto_index_existing_photos:
-                index_stats = self.index_existing_library()
-                summary["existing_newly_indexed"] = index_stats["newly_indexed"]
-                summary["errors"] += index_stats["errors"]
+            try:
+                # Recover any crash-interrupted quality upgrade swaps before ingesting
+                self.recover_in_progress_upgrades()
 
-            # 1. Process local watched inbox archives
-            ready_inbox = self._inbox_scanner.scan_ready_archives()
-            for item in ready_inbox:
-                existing = self.db.get_archive_by_source("inbox", item.source_id)
-                if existing and existing["status"] == "completed":
-                    continue
-                ok = self._process_inbox_archive(item)
-                if ok:
-                    summary["inbox_processed"] += 1
-                else:
-                    summary["errors"] += 1
+                # 0. Incrementally index existing NAS photos (isolated so a bad dir doesn't abort cycle)
+                if settings.auto_index_existing_photos:
+                    try:
+                        index_stats = self.index_existing_library()
+                        summary["existing_newly_indexed"] = index_stats["newly_indexed"]
+                        summary["errors"] += index_stats["errors"]
+                    except Exception as exc:
+                        err_msg = f"Existing NAS library indexing failed: {exc}"
+                        self._log("ERROR", "nas-index", err_msg)
+                        self._set_progress(last_error=err_msg)
+                        summary["errors"] += 1
 
-            # 2. Poll Google Drive if connected
-            gdrive = GoogleDriveClient(settings)
-            if gdrive.is_connected():
-                self._set_progress(state="scanning", current_step="Checking Google Drive Takeout folder")
-                try:
-                    drive_items = gdrive.list_takeout_archives()
-                except Exception as exc:
-                    err_msg = f"Google Drive poll failed: {exc}"
-                    self._log("ERROR", "gdrive", err_msg)
-                    self._set_progress(last_error=err_msg)
-                    Notifier(settings).send("Google Drive Poll Error", err_msg, level="error")
-                    summary["errors"] += 1
-                    drive_items = []
-
-                for item in drive_items:
-                    existing = self.db.get_archive_by_source("gdrive", item.file_id)
+                # 1. Process local watched inbox archives
+                ready_inbox = self._inbox_scanner.scan_ready_archives()
+                for item in ready_inbox:
+                    existing = self.db.get_archive_by_source("inbox", item.source_id)
                     if existing and existing["status"] == "completed":
                         continue
-                    ok = self._process_gdrive_archive(gdrive, item)
+                    ok = self._process_inbox_archive(item)
                     if ok:
-                        summary["gdrive_processed"] += 1
+                        summary["inbox_processed"] += 1
                     else:
                         summary["errors"] += 1
 
-            # 3. Optional Synology Photos DSM 7 API album sync
-            if settings.synology_api_enabled:
-                synced_count = self.sync_pending_albums()
-                summary["albums_synced"] = synced_count
+                # 2. Poll Google Drive if connected
+                gdrive = GoogleDriveClient(settings)
+                if gdrive.is_connected():
+                    self._set_progress(state="scanning", current_step="Checking Google Drive Takeout folder")
+                    try:
+                        drive_items = gdrive.list_takeout_archives()
+                    except Exception as exc:
+                        err_msg = f"Google Drive poll failed: {exc}"
+                        self._log("ERROR", "gdrive", err_msg)
+                        self._set_progress(last_error=err_msg)
+                        Notifier(settings).send_async("Google Drive Poll Error", err_msg, level="error")
+                        summary["errors"] += 1
+                        drive_items = []
 
-            # 4. Annual Google Takeout renewal check
-            self._check_renewal_reminder()
+                    for item in drive_items:
+                        existing = self.db.get_archive_by_source("gdrive", item.file_id)
+                        if existing and existing["status"] == "completed":
+                            continue
+                        ok = self._process_gdrive_archive(gdrive, item)
+                        if ok:
+                            summary["gdrive_processed"] += 1
+                        else:
+                            summary["errors"] += 1
 
-            self._set_progress(
-                state="idle",
-                current_archive="",
-                current_step="Idle — waiting for next scheduled poll",
-                last_run_at=utc_now_iso(),
-            )
-        except Exception as exc:
-            err_msg = f"Unexpected pipeline failure: {exc}"
-            self._log("ERROR", "pipeline", err_msg)
-            self._set_progress(state="error", current_step=err_msg, last_error=err_msg)
-            summary["errors"] += 1
+                # 3. Optional Synology Photos DSM 7 API album sync
+                if settings.synology_api_enabled:
+                    synced_count = self.sync_pending_albums()
+                    summary["albums_synced"] = synced_count
 
-        return summary
+                # 4. Annual Google Takeout renewal check
+                self._check_renewal_reminder()
+
+                self._set_progress(
+                    state="idle",
+                    current_archive="",
+                    current_step="Idle — waiting for next scheduled poll",
+                    last_run_at=utc_now_iso(),
+                )
+            except Exception as exc:
+                err_msg = f"Unexpected pipeline failure: {exc}"
+                self._log("ERROR", "pipeline", err_msg)
+                self._set_progress(state="error", current_step=err_msg, last_error=err_msg)
+                summary["errors"] += 1
+
+            return summary
 
     def _process_inbox_archive(self, item: InboxArchiveItem) -> bool:
         settings = self.config_manager.settings
@@ -249,16 +329,27 @@ class MigrationPipeline:
         work_subdir = settings.work_dir / f"archive_{archive_id}"
         try:
             stats = self._ingest_archive_file(archive_id, item.path, work_subdir)
-            self._inbox_scanner.finalize_archive(item.path)
+            # G1: Never finalize/delete source archive when any file failed
+            if stats["failed"] == 0:
+                self._inbox_scanner.finalize_archive(item.path)
+            else:
+                self._log(
+                    "WARNING",
+                    "inbox",
+                    (
+                        f"Keeping source archive {item.name} in inbox for retry because "
+                        f"{stats['failed']} file(s) failed to import"
+                    ),
+                )
             self._record_first_export_timestamp()
             self._notify_archive_done(item.name, stats)
-            return True
+            return stats["failed"] == 0
         except Exception as exc:
             err = str(exc)
             self.db.update_archive_progress(archive_id, status="failed", error_message=err)
             self._log("ERROR", "inbox", f"Failed processing {item.name}: {err}")
             self._set_progress(last_error=err)
-            Notifier(settings).send(f"Migration Failed: {item.name}", err, level="error")
+            Notifier(settings).send_async(f"Migration Failed: {item.name}", err, level="error")
             return False
         finally:
             cleanup_directory(work_subdir)
@@ -309,16 +400,25 @@ class MigrationPipeline:
                     self._log("WARNING", "gdrive", f"Could not trash {item.name} in Drive: {exc}")
 
             self._notify_archive_done(item.name, stats)
-            return True
+            return stats["failed"] == 0
         except Exception as exc:
             err = str(exc)
             self.db.update_archive_progress(archive_id, status="failed", error_message=err)
             self._log("ERROR", "gdrive", f"Failed processing Drive archive {item.name}: {err}")
             self._set_progress(last_error=err)
-            Notifier(settings).send(f"Drive Migration Failed: {item.name}", err, level="error")
+            Notifier(settings).send_async(f"Drive Migration Failed: {item.name}", err, level="error")
             return False
         finally:
             cleanup_directory(work_subdir)
+
+    def _compute_extraction_byte_cap(self) -> int | None:
+        settings = self.config_manager.settings
+        free_gb = get_free_disk_gb(settings.work_dir)
+        usable_gb = free_gb - settings.min_free_disk_gb
+        if usable_gb <= 0:
+            # Already passed disk guard (or tiny test disk); allow a small safe cap
+            return max(256 * 1024 * 1024, int(free_gb * 0.5 * (1024**3)))
+        return int(usable_gb * (1024**3))
 
     def _ingest_archive_file(
         self,
@@ -338,7 +438,12 @@ class MigrationPipeline:
             processed_files=0,
             total_files=0,
         )
-        extract_archive(archive_path, extract_dir)
+        extract_archive(
+            archive_path,
+            extract_dir,
+            max_uncompressed_bytes=self._compute_extraction_byte_cap(),
+            skip_unsafe_entries=True,
+        )
 
         # Discover all media files grouped by directory so we build each DirectoryJsonIndex once
         media_by_dir: dict[Path, list[Path]] = {}
@@ -411,6 +516,23 @@ class MigrationPipeline:
                         perceptual_max_distance=settings.perceptual_max_distance,
                     )
                     if existing is not None:
+                        # G2: If the DB points to a missing file on disk, repair it instead of skipping forever
+                        existing_rel = str(existing["dest_rel_path"])
+                        existing_abs = settings.photos_dir / existing_rel
+                        if not existing_abs.is_file():
+                            self._repair_missing_existing_media(
+                                existing=existing,
+                                incoming_path=media_path,
+                                incoming_fp=fp,
+                                metadata=metadata,
+                                taken_at_iso=taken_at_iso,
+                                importer=importer,
+                            )
+                            if album_name:
+                                self.db.add_media_to_album(album_name, int(existing["id"]))
+                            imported += 1
+                            continue
+
                         upgraded = False
                         if (
                             match_reason in ("pixel_sha256", "perceptual_dhash")
@@ -433,6 +555,12 @@ class MigrationPipeline:
                             imported += 1
                         else:
                             duplicates += 1
+                            if match_reason == "perceptual_dhash":
+                                self._log(
+                                    "INFO",
+                                    "perceptual-dedup",
+                                    f"Perceptual duplicate skipped: {media_path.name} matched {existing_rel}",
+                                )
                         continue
 
                     exif_status = apply_metadata(
@@ -474,6 +602,7 @@ class MigrationPipeline:
                         longitude=metadata.longitude,
                         exif_status=exif_status,
                         source_archive_id=archive_id,
+                        visual_status=fp.visual_status,
                     )
                     if album_name:
                         self.db.add_media_to_album(album_name, media_id)
@@ -491,19 +620,22 @@ class MigrationPipeline:
                             failed_files=failed,
                         )
 
+        # G1: Only mark 'completed' when zero files failed; otherwise retryable 'completed_with_errors'
+        final_status = "completed" if failed == 0 else "completed_with_errors"
         self.db.update_archive_progress(
             archive_id,
-            status="completed",
+            status=final_status,
             total_files=total_files,
             imported_files=imported,
             duplicate_files=duplicates,
             failed_files=failed,
-            completed=True,
+            completed=(failed == 0),
         )
         self._log(
-            "INFO",
+            "WARNING" if failed > 0 else "INFO",
             "pipeline",
-            f"Completed {archive_path.name}: {imported} imported, {duplicates} duplicates skipped, {failed} failed",
+            f"Finished {archive_path.name} ({final_status}): {imported} imported, "
+            f"{duplicates} duplicates skipped, {failed} failed",
         )
         return {
             "total": total_files,
@@ -511,6 +643,54 @@ class MigrationPipeline:
             "duplicates": duplicates,
             "failed": failed,
         }
+
+    def _repair_missing_existing_media(
+        self,
+        *,
+        existing: dict[str, Any],
+        incoming_path: Path,
+        incoming_fp: Any,
+        metadata: PhotoMetadata,
+        taken_at_iso: str | None,
+        importer: SynologyFolderImporter,
+    ) -> None:
+        """Repair a phantom DB row whose on-disk photo disappeared by importing the incoming copy."""
+        settings = self.config_manager.settings
+        exif_status = apply_metadata(
+            incoming_path,
+            metadata,
+            write_exif=settings.write_exif_metadata,
+            write_album_tags=settings.write_album_tags,
+            exiftool_path=settings.exiftool_path,
+        )
+        final_hash = compute_file_sha256(incoming_path)
+        dest_abs, dest_rel = importer.import_media(incoming_path, metadata)
+        dest_stat = dest_abs.stat()
+        self.db.upgrade_media_item(
+            int(existing["id"]),
+            original_sha256=incoming_fp.sha256,
+            final_sha256=final_hash,
+            pixel_sha256=incoming_fp.pixel_sha256,
+            dhash=incoming_fp.dhash,
+            width=incoming_fp.width,
+            height=incoming_fp.height,
+            sharpness=incoming_fp.sharpness,
+            quality_score=incoming_fp.quality_score,
+            original_filename=incoming_path.name,
+            dest_rel_path=dest_rel,
+            file_size=dest_stat.st_size,
+            file_mtime_ns=dest_stat.st_mtime_ns,
+            taken_at=taken_at_iso,
+            exif_status=exif_status,
+            visual_status=incoming_fp.visual_status,
+            latitude=metadata.latitude,
+            longitude=metadata.longitude,
+        )
+        self._log(
+            "WARNING",
+            "pipeline",
+            f"Repaired missing library file {existing['dest_rel_path']} with {dest_rel}",
+        )
 
     def _maybe_upgrade_duplicate(
         self,
@@ -523,7 +703,7 @@ class MigrationPipeline:
         match_reason: str,
         importer: SynologyFolderImporter,
     ) -> bool:
-        """Compare visual duplicate quality and auto-upgrade if incoming is clearer/higher-res."""
+        """Compare visual duplicate quality and crash-atomically auto-upgrade if incoming is better (G2)."""
         settings = self.config_manager.settings
         existing_rel = str(existing["dest_rel_path"])
         existing_abs = settings.photos_dir / existing_rel
@@ -531,13 +711,21 @@ class MigrationPipeline:
             return False
 
         incoming_size = incoming_path.stat().st_size
+        existing_stat = existing_abs.stat()
         existing_width = int(existing.get("width") or 0)
         existing_height = int(existing.get("height") or 0)
         existing_sharpness = float(existing.get("sharpness") or 0.0)
-        existing_size = int(existing.get("file_size") or existing_abs.stat().st_size)
+        existing_size = existing_stat.st_size
 
-        # Backfill existing dimensions/sharpness on the fly if missing
-        if existing_width <= 0 or existing_height <= 0:
+        # G2: Re-fingerprint existing file if missing dimensions OR on-disk file diverged from DB
+        db_size = int(existing.get("file_size") or 0)
+        db_mtime = int(existing.get("file_mtime_ns") or 0)
+        if (
+            existing_width <= 0
+            or existing_height <= 0
+            or (db_size > 0 and db_size != existing_stat.st_size)
+            or (db_mtime > 0 and db_mtime != existing_stat.st_mtime_ns)
+        ):
             ext_fp = compute_media_fingerprint(existing_abs, compute_visual=True)
             existing_width = ext_fp.width
             existing_height = ext_fp.height
@@ -571,50 +759,26 @@ class MigrationPipeline:
             exiftool_path=settings.exiftool_path,
         )
         final_hash = compute_file_sha256(incoming_path)
+        repaired_incoming_size = incoming_path.stat().st_size
 
-        # 1. Move replaced lower-quality file into safe quarantine outside PHOTOS_DIR
+        # Prepare collision-safe quarantine destination outside PHOTOS_DIR
         quarantine_dir = settings.quarantine_dir
         quarantine_dir.mkdir(parents=True, exist_ok=True)
         media_id = int(existing["id"])
-        q_name = f"media{media_id}_{int(datetime.now(UTC).timestamp())}_{existing_abs.name}"
+        ts_now = int(datetime.now(UTC).timestamp())
+        q_name = f"media{media_id}_{ts_now}_{existing_abs.name}"
         q_path = quarantine_dir / q_name
         counter = 2
         while q_path.exists():
-            q_name = f"media{media_id}_{int(datetime.now(UTC).timestamp())}_{counter}_{existing_abs.name}"
+            q_name = f"media{media_id}_{ts_now}_{counter}_{existing_abs.name}"
             q_path = quarantine_dir / q_name
             counter += 1
-        safe_move_or_copy(existing_abs, q_path)
 
-        # 2. Place higher-quality image into PHOTOS_DIR (keep same folder if same extension)
-        if existing_abs.suffix.lower() == incoming_path.suffix.lower():
-            dest_abs = existing_abs
-            safe_move_or_copy(incoming_path, dest_abs)
-            dest_rel = dest_abs.relative_to(settings.photos_dir).as_posix()
-        else:
-            dest_abs, dest_rel = importer.import_media(incoming_path, metadata)
-
-        dest_stat = dest_abs.stat()
-        self.db.upgrade_media_item(
-            media_id,
-            original_sha256=incoming_fp.sha256,
-            final_sha256=final_hash,
-            pixel_sha256=incoming_fp.pixel_sha256,
-            dhash=incoming_fp.dhash,
-            width=incoming_fp.width,
-            height=incoming_fp.height,
-            sharpness=incoming_fp.sharpness,
-            quality_score=incoming_fp.quality_score,
-            original_filename=incoming_path.name,
-            dest_rel_path=dest_rel,
-            file_size=dest_stat.st_size,
-            file_mtime_ns=dest_stat.st_mtime_ns,
-            taken_at=taken_at_iso,
-            exif_status=exif_status,
-        )
-        self.db.record_quality_upgrade(
+        # G2: Write-ahead 'in_progress' journal record BEFORE touching the filesystem
+        upgrade_id = self.db.create_pending_quality_upgrade(
             media_id=media_id,
-            kept_rel_path=dest_rel,
             quarantine_filename=q_name,
+            old_rel_path=existing_rel,
             old_filename=existing_abs.name,
             new_filename=incoming_path.name,
             old_width=existing_width,
@@ -623,11 +787,68 @@ class MigrationPipeline:
             old_sharpness=existing_sharpness,
             new_width=incoming_fp.width,
             new_height=incoming_fp.height,
-            new_file_size=dest_stat.st_size,
+            new_file_size=repaired_incoming_size,
             new_sharpness=incoming_fp.sharpness,
             match_reason=match_reason,
             upgrade_reason=decision.reason,
+            old_taken_at=str(existing.get("taken_at") or ""),
+            old_latitude=existing.get("latitude"),
+            old_longitude=existing.get("longitude"),
         )
+
+        moved_existing = False
+        placed_dest: Path | None = None
+        try:
+            # 1. Move replaced lower-quality file into safe quarantine
+            safe_move_or_copy(existing_abs, q_path)
+            moved_existing = True
+
+            # 2. Place higher-quality image into PHOTOS_DIR. When the format
+            #    (extension) matches, upgrade in place at the existing library
+            #    path so the media record's path/filename is preserved; only a
+            #    genuine format change imports under the incoming name.
+            if existing_abs.suffix.lower() == incoming_path.suffix.lower():
+                dest_abs = existing_abs
+                safe_move_or_copy(incoming_path, dest_abs)
+                dest_rel = existing_rel
+            else:
+                dest_abs, dest_rel = importer.import_media(incoming_path, metadata)
+            placed_dest = dest_abs
+
+            dest_stat = dest_abs.stat()
+            self.db.upgrade_media_item(
+                media_id,
+                original_sha256=incoming_fp.sha256,
+                final_sha256=final_hash,
+                pixel_sha256=incoming_fp.pixel_sha256,
+                dhash=incoming_fp.dhash,
+                width=incoming_fp.width,
+                height=incoming_fp.height,
+                sharpness=incoming_fp.sharpness,
+                quality_score=incoming_fp.quality_score,
+                original_filename=incoming_path.name,
+                dest_rel_path=dest_rel,
+                file_size=dest_stat.st_size,
+                file_mtime_ns=dest_stat.st_mtime_ns,
+                taken_at=taken_at_iso,
+                exif_status=exif_status,
+                visual_status=incoming_fp.visual_status,
+                latitude=metadata.latitude,
+                longitude=metadata.longitude,
+            )
+            self.db.finalize_quality_upgrade(upgrade_id, dest_rel, new_file_size=dest_stat.st_size)
+        except Exception:
+            # Roll back filesystem & journal cleanly so no photo is ever lost
+            if placed_dest is not None and placed_dest != existing_abs and placed_dest.is_file():
+                with contextlib.suppress(OSError):
+                    placed_dest.unlink()
+            if moved_existing and q_path.is_file():
+                with contextlib.suppress(Exception):
+                    safe_move_or_copy(q_path, existing_abs)
+            with contextlib.suppress(Exception):
+                self.db.delete_quality_upgrade(upgrade_id)
+            raise
+
         self._log(
             "INFO",
             "quality-upgrade",
@@ -636,71 +857,133 @@ class MigrationPipeline:
         return True
 
     def restore_quality_upgrade(self, upgrade_id: int) -> dict[str, Any]:
-        """Restore a quarantined original image back into PHOTOS_DIR and undo the upgrade."""
-        settings = self.config_manager.settings
-        row = self.db.get_quality_upgrade(upgrade_id)
-        if row is None:
-            raise ValueError(f"Quality upgrade #{upgrade_id} not found")
-        if row["status"] != "quarantined":
-            raise ValueError(f"Upgrade #{upgrade_id} is already '{row['status']}'")
+        """Safely restore a quarantined original image back into PHOTOS_DIR and undo the upgrade."""
+        with self._op_lock:
+            settings = self.config_manager.settings
+            row = self.db.get_quality_upgrade(upgrade_id)
+            if row is None:
+                raise ValueError(f"Quality upgrade #{upgrade_id} not found")
+            if row["status"] != "quarantined":
+                raise ValueError(f"Upgrade #{upgrade_id} is already '{row['status']}'")
 
-        q_path = settings.quarantine_dir / str(row["quarantine_filename"])
-        if not q_path.is_file():
-            raise FileNotFoundError(f"Quarantined file missing: {q_path.name}")
+            q_path = _resolve_contained(settings.quarantine_dir, str(row["quarantine_filename"]))
+            if not q_path.is_file():
+                raise FileNotFoundError(f"Quarantined file missing: {q_path.name}")
 
-        kept_abs = settings.photos_dir / str(row["kept_rel_path"])
-        restore_abs = kept_abs.parent / str(row["old_filename"])
-        if kept_abs.exists():
-            kept_abs.unlink()
+            kept_abs = _resolve_contained(settings.photos_dir, str(row["kept_rel_path"]))
+            old_rel = str(row.get("old_rel_path") or "").strip()
+            if old_rel:
+                restore_abs = _resolve_contained(settings.photos_dir, old_rel)
+            else:
+                restore_abs = _resolve_contained(
+                    kept_abs.parent, str(row["old_filename"])
+                )
+                # Ensure restore_abs stays inside photos_dir
+                _resolve_contained(
+                    settings.photos_dir,
+                    restore_abs.relative_to(settings.photos_dir.resolve()).as_posix(),
+                )
 
-        safe_move_or_copy(q_path, restore_abs)
-        restored_rel = restore_abs.relative_to(settings.photos_dir).as_posix()
-        fp = compute_media_fingerprint(restore_abs, compute_visual=True)
-        st = restore_abs.stat()
+            # Avoid clobbering an unrelated file if another photo now sits at restore_abs
+            if restore_abs != kept_abs and restore_abs.exists():
+                stem = restore_abs.stem
+                suffix = restore_abs.suffix
+                counter = 2
+                candidate = restore_abs.with_name(f"{stem}_restored_{counter}{suffix}")
+                while candidate.exists():
+                    counter += 1
+                    candidate = restore_abs.with_name(f"{stem}_restored_{counter}{suffix}")
+                restore_abs = candidate
 
-        if row["media_id"] is not None:
-            self.db.upgrade_media_item(
-                int(row["media_id"]),
-                original_sha256=fp.sha256,
-                final_sha256=fp.sha256,
-                pixel_sha256=fp.pixel_sha256,
-                dhash=fp.dhash,
-                width=fp.width,
-                height=fp.height,
-                sharpness=fp.sharpness,
-                quality_score=fp.quality_score,
-                original_filename=restore_abs.name,
-                dest_rel_path=restored_rel,
-                file_size=st.st_size,
-                file_mtime_ns=st.st_mtime_ns,
-                taken_at=fp.exif_taken_at,
-                exif_status="existing",
+            # Stage kept_abs aside before moving q_path in, so failure never loses both copies
+            staged_kept: Path | None = None
+            if kept_abs.is_file():
+                staged_kept = kept_abs.with_name(f".{kept_abs.name}.restore_tmp.{os.getpid()}")
+                safe_move_or_copy(kept_abs, staged_kept)
+
+            try:
+                safe_move_or_copy(q_path, restore_abs)
+            except Exception:
+                if staged_kept is not None and staged_kept.is_file() and not kept_abs.exists():
+                    with contextlib.suppress(Exception):
+                        safe_move_or_copy(staged_kept, kept_abs)
+                raise
+            else:
+                if staged_kept is not None and staged_kept.is_file():
+                    with contextlib.suppress(OSError):
+                        staged_kept.unlink()
+
+            restored_rel = restore_abs.resolve().relative_to(settings.photos_dir.resolve()).as_posix()
+            fp = compute_media_fingerprint(restore_abs, compute_visual=True)
+            st = restore_abs.stat()
+
+            preserved_taken_at = str(row.get("old_taken_at") or "").strip() or fp.exif_taken_at
+            preserved_lat = row.get("old_latitude")
+            preserved_lon = row.get("old_longitude")
+
+            if row["media_id"] is not None:
+                self.db.upgrade_media_item(
+                    int(row["media_id"]),
+                    original_sha256=fp.sha256,
+                    final_sha256=fp.sha256,
+                    pixel_sha256=fp.pixel_sha256,
+                    dhash=fp.dhash,
+                    width=fp.width,
+                    height=fp.height,
+                    sharpness=fp.sharpness,
+                    quality_score=fp.quality_score,
+                    original_filename=restore_abs.name,
+                    dest_rel_path=restored_rel,
+                    file_size=st.st_size,
+                    file_mtime_ns=st.st_mtime_ns,
+                    taken_at=preserved_taken_at,
+                    exif_status="existing",
+                    visual_status=fp.visual_status,
+                    latitude=preserved_lat,
+                    longitude=preserved_lon,
+                )
+
+            self.db.mark_quality_upgrade_status(upgrade_id, "restored")
+            self._log(
+                "INFO",
+                "quality-upgrade",
+                f"Restored quarantined copy {restore_abs.name} -> {restored_rel}",
             )
-
-        self.db.mark_quality_upgrade_status(upgrade_id, "restored")
-        self._log("INFO", "quality-upgrade", f"Restored quarantined copy {restore_abs.name} -> {restored_rel}")
-        return {"ok": True, "restored_rel_path": restored_rel}
+            return {"ok": True, "restored_rel_path": restored_rel}
 
     def purge_quality_upgrade(self, upgrade_id: int) -> dict[str, Any]:
         """Permanently delete a single quarantined lower-quality copy after review."""
-        settings = self.config_manager.settings
-        row = self.db.get_quality_upgrade(upgrade_id)
-        if row is None:
-            raise ValueError(f"Quality upgrade #{upgrade_id} not found")
-        q_path = settings.quarantine_dir / str(row["quarantine_filename"])
-        q_path.unlink(missing_ok=True)
-        self.db.mark_quality_upgrade_status(upgrade_id, "purged")
-        self._log("INFO", "quality-upgrade", f"Purged quarantined duplicate {row['quarantine_filename']}")
-        return {"ok": True}
+        with self._op_lock:
+            settings = self.config_manager.settings
+            row = self.db.get_quality_upgrade(upgrade_id)
+            if row is None:
+                raise ValueError(f"Quality upgrade #{upgrade_id} not found")
+            if row["status"] != "quarantined":
+                raise ValueError(
+                    f"Upgrade #{upgrade_id} cannot be purged from status '{row['status']}'"
+                )
+            q_path = _resolve_contained(settings.quarantine_dir, str(row["quarantine_filename"]))
+            q_path.unlink(missing_ok=True)
+            self.db.mark_quality_upgrade_status(upgrade_id, "purged")
+            self._log(
+                "INFO",
+                "quality-upgrade",
+                f"Purged quarantined duplicate {row['quarantine_filename']}",
+            )
+            return {"ok": True}
 
     def purge_all_quarantined(self) -> int:
-        """Permanently delete all quarantined lower-quality copies."""
-        purged = 0
-        for row in self.db.list_quality_upgrades(limit=1000):
-            if row["status"] == "quarantined":
-                self.purge_quality_upgrade(int(row["id"]))
-                purged += 1
-        return purged
+        """Permanently delete all quarantined lower-quality copies in batches."""
+        with self._op_lock:
+            purged = 0
+            while True:
+                batch = self.db.list_quarantined_upgrades_batch(limit=500)
+                if not batch:
+                    break
+                for row in batch:
+                    self.purge_quality_upgrade(int(row["id"]))
+                    purged += 1
+            return purged
 
     def sync_pending_albums(self) -> int:
         """Sync pending Takeout album memberships into Synology Photos via DSM 7 API."""
@@ -742,12 +1025,13 @@ class MigrationPipeline:
                                 self.db.set_media_synology_id(media_id, syno_item_id)
 
                         if syno_item_id is None:
-                            # Synology DSM may still be indexing newly written files; retry next cycle
+                            # Synology DSM may still be indexing newly written files; do not burn retries
                             self.db.mark_album_membership(
                                 album_id,
                                 media_id,
                                 status="pending",
                                 error="Waiting for Synology Photos to index file",
+                                increment_retry=False,
                             )
                         else:
                             resolved_pairs.append((media_id, int(syno_item_id)))
@@ -806,7 +1090,7 @@ class MigrationPipeline:
             "then click 'Reset Schedule Timer' in the dashboard."
         )
         self._log("WARNING", "schedule", msg)
-        Notifier(settings).send("Renew Google Takeout Annual Schedule", msg, level="info")
+        Notifier(settings).send_async("Renew Google Takeout Annual Schedule", msg, level="info")
         self.db.set_state("last_renewal_reminder_at", utc_now_iso())
 
     def _notify_archive_done(self, filename: str, stats: dict[str, int]) -> None:
@@ -818,4 +1102,4 @@ class MigrationPipeline:
             f"Failed: {stats['failed']}"
         )
         level = "error" if stats["failed"] > 0 else "info"
-        Notifier(settings).send(f"Migration Complete: {filename}", msg, level=level)
+        Notifier(settings).send_async(f"Migration Complete: {filename}", msg, level=level)

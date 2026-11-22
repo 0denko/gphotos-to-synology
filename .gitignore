@@ -11,3 +11,8 @@ data/
 *.db
 *.db-shm
 *.db-wal
+
+# Agent scratch files (never commit)
+.agents/
+PROJECT.md
+TEST_INFRA.md

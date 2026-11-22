@@ -2,13 +2,18 @@
 """Same-origin DSM 7 CGI reverse proxy for Google Photos Migrator.
 
 Synology DSM 7 nginx routes `/webman/3rdparty/.../*.cgi` (matching `\\.cgi$`
-without PATH_INFO). Therefore subpaths are passed via the `p` query parameter:
+without PATH_INFO). Subpaths are passed via the `p` query parameter:
     https://<nas>:5001/webman/3rdparty/gphotos-migrator/proxy.cgi?p=/api/status
 and forwarded to the local daemon at:
     http://127.0.0.1:8765/api/status
+with server-side DSM authentication, X-Proxy-Secret, X-DSM-User, X-DSM-Admin,
+and X-Requested-With CSRF header forwarding.
 """
 
+import grp
+import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -18,6 +23,9 @@ import urllib.request
 BACKEND_BASE = os.environ.get("GPHOTOS_BACKEND_URL", "http://127.0.0.1:8765").rstrip("/")
 UI_PREFIX = "/webman/3rdparty/gphotos-migrator"
 AUTH_CGI = "/usr/syno/synoman/webman/authenticate.cgi"
+DEFAULT_SECRET_FILE = "/var/packages/gphotos-migrator/var/proxy.secret"
+MAX_REQUEST_BODY_BYTES = 1024 * 1024  # 1 MiB cap for JSON API payloads
+DSM_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -32,11 +40,26 @@ HOP_BY_HOP_HEADERS = {
 }
 
 
+def get_proxy_secret():
+    env_secret = os.environ.get("GPHOTOS_PROXY_SECRET", "").strip()
+    if env_secret:
+        return env_secret
+    secret_file = os.environ.get("GPHOTOS_PROXY_SECRET_FILE", DEFAULT_SECRET_FILE)
+    try:
+        if os.path.isfile(secret_file):
+            with open(secret_file, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+    except OSError:
+        pass
+    return ""
+
+
 def get_dsm_user():
-    """Verify an active Synology DSM web session and return the authenticated DSM username."""
+    """Verify an active Synology DSM web session and return a validated DSM username."""
     if not os.path.isfile(AUTH_CGI):
         if os.environ.get("GPHOTOS_SKIP_DSM_AUTH") == "1":
-            return os.environ.get("GPHOTOS_TEST_DSM_USER", "admin")
+            user = os.environ.get("GPHOTOS_TEST_DSM_USER", "admin").strip()
+            return user if DSM_USER_RE.match(user) else None
         return None
     try:
         proc = subprocess.run(
@@ -46,19 +69,48 @@ def get_dsm_user():
             timeout=5,
             check=False,
         )
-        user = (proc.stdout or "").strip()
-        return user if user else None
+        lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        if not lines:
+            return None
+        user = lines[-1]
+        return user if DSM_USER_RE.match(user) else None
     except Exception:
         return None
 
 
+def is_dsm_admin(username):
+    """Determine if the authenticated DSM user belongs to the Synology administrators group."""
+    if not os.path.isfile(AUTH_CGI) and os.environ.get("GPHOTOS_SKIP_DSM_AUTH") == "1":
+        return os.environ.get("GPHOTOS_TEST_DSM_ADMIN", "1").strip() == "1"
+    if not username:
+        return False
+    try:
+        admin_grp = grp.getgrnam("administrators")
+        if username in admin_grp.gr_mem:
+            return True
+    except KeyError:
+        pass
+    return username == "admin"
+
+
+def _sanitize_header_part(value):
+    s = str(value)
+    if "\r" in s or "\n" in s or "\x00" in s:
+        return None
+    return s
+
+
 def write_response(status, headers, body):
     out = sys.stdout.buffer
-    out.write(("Status: %d\r\n" % status).encode("ascii"))
+    out.write(("Status: %d\r\n" % int(status)).encode("ascii"))
     for k, v in headers:
         if k.lower() in HOP_BY_HOP_HEADERS:
             continue
-        out.write(("%s: %s\r\n" % (k, v)).encode("latin-1", errors="ignore"))
+        sk = _sanitize_header_part(k)
+        sv = _sanitize_header_part(v)
+        if sk is None or sv is None:
+            continue
+        out.write(("%s: %s\r\n" % (sk, sv)).encode("latin-1", errors="ignore"))
     out.write(("Content-Length: %d\r\n" % len(body)).encode("ascii"))
     out.write(b"\r\n")
     out.write(body)
@@ -137,8 +189,17 @@ def main():
 
     req_body = None
     content_length_raw = os.environ.get("CONTENT_LENGTH", "").strip()
-    if content_length_raw.isdigit() and int(content_length_raw) > 0:
-        req_body = sys.stdin.buffer.read(int(content_length_raw))
+    if content_length_raw.isdigit():
+        content_len = int(content_length_raw)
+        if content_len > MAX_REQUEST_BODY_BYTES:
+            write_response(
+                413,
+                [("Content-Type", "application/json; charset=utf-8")],
+                json.dumps({"detail": "Request payload too large (max 1 MiB)"}).encode("utf-8"),
+            )
+            return
+        if content_len > 0:
+            req_body = sys.stdin.buffer.read(content_len)
 
     proto = "https" if os.environ.get("HTTPS", "").lower() in ("on", "1", "true") else "http"
     if os.environ.get("SERVER_PORT") == "5001":
@@ -150,15 +211,30 @@ def main():
         "X-Forwarded-Prefix": UI_PREFIX,
         "X-Proxy-Mode": "cgi",
         "X-DSM-User": dsm_user,
+        "X-DSM-Admin": "1" if is_dsm_admin(dsm_user) else "0",
     }
-    if host:
-        headers["X-Forwarded-Host"] = host
-    if os.environ.get("CONTENT_TYPE"):
-        headers["Content-Type"] = os.environ["CONTENT_TYPE"]
-    if os.environ.get("HTTP_ACCEPT"):
-        headers["Accept"] = os.environ["HTTP_ACCEPT"]
-    if os.environ.get("HTTP_X_PROFILE_ID"):
-        headers["X-Profile-Id"] = os.environ["HTTP_X_PROFILE_ID"]
+    proxy_secret = get_proxy_secret()
+    if proxy_secret:
+        headers["X-Proxy-Secret"] = proxy_secret
+    raw_forward = [
+        ("X-Forwarded-Host", host),
+        ("Content-Type", os.environ.get("CONTENT_TYPE", "")),
+        ("Accept", os.environ.get("HTTP_ACCEPT", "")),
+        ("X-Profile-Id", os.environ.get("HTTP_X_PROFILE_ID", "")),
+        ("X-Requested-With", os.environ.get("HTTP_X_REQUESTED_WITH", "")),
+    ]
+    for hdr_name, hdr_val in raw_forward:
+        if not hdr_val:
+            continue
+        safe_val = _sanitize_header_part(hdr_val)
+        if safe_val is None:
+            write_response(
+                400,
+                [("Content-Type", "application/json; charset=utf-8")],
+                json.dumps({"detail": "Invalid control characters in request header"}).encode("utf-8"),
+            )
+            return
+        headers[hdr_name] = safe_val
 
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, hdrs, newurl):
@@ -180,12 +256,19 @@ def main():
         body = err.read() if err.fp else b""
         write_response(err.code, resp_headers, body)
     except (urllib.error.URLError, OSError):
-        # Return HTTP 200 so Synology DSM nginx does not replace our starting page with a generic 503 error page
-        write_response(
-            200,
-            [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
-            render_backend_offline_html(),
-        )
+        if method == "GET" and target_path == "/":
+            # Return HTTP 200 HTML only for GET / so DSM nginx renders our friendly auto-refreshing startup screen
+            write_response(
+                200,
+                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+                render_backend_offline_html(),
+            )
+        else:
+            write_response(
+                503,
+                [("Content-Type", "application/json; charset=utf-8"), ("Cache-Control", "no-store")],
+                json.dumps({"detail": "Google Photos Migrator service is starting or unavailable"}).encode("utf-8"),
+            )
 
 
 if __name__ == "__main__":

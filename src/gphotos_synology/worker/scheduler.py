@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from gphotos_synology.config import ConfigManager
-from gphotos_synology.database import StateDB
+from gphotos_synology.database import StateDB, utc_now_iso
+from gphotos_synology.takeout.extractor import cleanup_stale_temp_files
 from gphotos_synology.worker.pipeline import MigrationPipeline
 
 if TYPE_CHECKING:
@@ -55,6 +57,13 @@ class BackgroundScheduler:
         if self.is_running:
             return
         self._stop_event.clear()
+        # Recover any interrupted upgrade swaps and clean stale .tmp.<pid> files on startup
+        for pipe in self._all_pipelines():
+            try:
+                pipe.recover_in_progress_upgrades()
+                cleanup_stale_temp_files(pipe.config_manager.settings.photos_dir, max_age_seconds=300.0)
+            except Exception as exc:
+                logger.warning("Startup recovery check failed: %s", exc)
         self._thread = threading.Thread(
             target=self._loop,
             name="gphotos-migrator-worker",
@@ -68,6 +77,9 @@ class BackgroundScheduler:
         self._wake_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=10.0)
+        for pipe in self._all_pipelines():
+            with contextlib.suppress(Exception):
+                cleanup_stale_temp_files(pipe.config_manager.settings.photos_dir, max_age_seconds=0.0)
         self.db.log_event("INFO", "scheduler", "Background migration worker stopped")
 
     def _all_pipelines(self) -> list[MigrationPipeline]:
@@ -79,7 +91,11 @@ class BackgroundScheduler:
         self._paused = True
         self.db.set_state("worker_paused", "true")
         for pipe in self._all_pipelines():
-            pipe._set_progress(state="paused", current_step="Worker paused by user")
+            pipe._set_progress(
+                state="paused",
+                current_step="Worker paused by user",
+                next_run_at=None,
+            )
         self.db.log_event("INFO", "scheduler", "Background worker paused")
 
     def resume(self) -> None:
@@ -138,22 +154,32 @@ class BackgroundScheduler:
                             pipe._set_progress(
                                 state="idle",
                                 current_step="Idle — waiting for next scheduled poll",
+                                last_run_at=utc_now_iso(),
                             )
                         elif mode == "index_existing":
                             pipe.index_existing_library()
                             pipe._set_progress(
                                 state="idle",
                                 current_step="Idle — existing NAS library indexed",
+                                last_run_at=utc_now_iso(),
                             )
                         else:
                             pipe.run_cycle()
             else:
                 for pipe in self._all_pipelines():
-                    pipe._set_progress(state="paused", current_step="Worker paused by user")
+                    pipe._set_progress(
+                        state="paused",
+                        current_step="Worker paused by user",
+                        next_run_at=None,
+                    )
 
             interval_s = max(60, self.config_manager.settings.poll_interval_minutes * 60)
-            next_dt = datetime.now(UTC) + timedelta(seconds=interval_s)
-            for pipe in self._all_pipelines():
-                pipe._set_progress(next_run_at=next_dt.isoformat())
+            if self._paused:
+                for pipe in self._all_pipelines():
+                    pipe._set_progress(next_run_at=None)
+            else:
+                next_dt = datetime.now(UTC) + timedelta(seconds=interval_s)
+                for pipe in self._all_pipelines():
+                    pipe._set_progress(next_run_at=next_dt.isoformat())
 
             self._wake_event.wait(timeout=interval_s)

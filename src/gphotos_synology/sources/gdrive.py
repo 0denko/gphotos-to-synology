@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import contextlib
+import hashlib
 import logging
 import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -37,11 +38,20 @@ class DriveArchiveItem:
     batch_key: str
 
 
+def _compute_file_md5(path: Path) -> str:
+    digest = hashlib.md5()
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class GoogleDriveClient:
     """Handles OAuth2 token lifecycle and background Google Drive Takeout polling."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.last_auth_error: str = ""
 
     @property
     def scopes(self) -> list[str]:
@@ -97,36 +107,58 @@ class GoogleDriveClient:
         token_path = self.settings.token_path
         token_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = token_path.with_suffix(".tmp")
-        tmp.write_text(creds.to_json(), encoding="utf-8")
-        with contextlib.suppress(OSError):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(creds.to_json())
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+        try:
             os.chmod(tmp, 0o600)
+        except OSError as exc:
+            logger.warning("Could not enforce 0600 permissions on %s: %s", token_path, exc)
         os.replace(tmp, token_path)
 
     def disconnect(self) -> None:
         self.settings.token_path.unlink(missing_ok=True)
+        self.last_auth_error = ""
 
     def get_credentials(self) -> Credentials | None:
         """Load stored OAuth2 credentials and refresh automatically if expired."""
+        self.last_auth_error = ""
         token_path = self.settings.token_path
         if not token_path.exists():
             return None
         try:
             creds = Credentials.from_authorized_user_file(str(token_path))
         except Exception as exc:
-            logger.error("Failed to load Google token file: %s", exc)
+            self.last_auth_error = f"Failed to load Google token file: {exc}"
+            logger.error("%s", self.last_auth_error)
             return None
 
         if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            self._save_credentials(creds)
+            try:
+                creds.refresh(Request())
+                self._save_credentials(creds)
+            except Exception as exc:
+                self.last_auth_error = f"Google OAuth token refresh failed: {exc}"
+                logger.warning("%s", self.last_auth_error)
+                raise
 
         return creds if creds.valid else None
 
-    def is_connected(self) -> bool:
+    def connection_status(self) -> dict[str, Any]:
+        """Return connection state plus any token refresh/load error for UI display."""
         try:
-            return self.get_credentials() is not None
-        except Exception:
-            return False
+            creds = self.get_credentials()
+            return {"connected": creds is not None, "error": self.last_auth_error}
+        except Exception as exc:
+            return {"connected": False, "error": self.last_auth_error or str(exc)}
+
+    def is_connected(self) -> bool:
+        return bool(self.connection_status()["connected"])
 
     def _build_service(self):
         creds = self.get_credentials()
@@ -135,18 +167,31 @@ class GoogleDriveClient:
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
     def find_takeout_folder_ids(self, service) -> list[str]:
-        """Locate all non-trashed Drive folders matching `gdrive_folder_name` (e.g. 'Takeout')."""
+        """Locate all non-trashed Drive folders matching `gdrive_folder_name` (paginated)."""
         folder_name = self.settings.gdrive_folder_name.replace("'", "\\'")
         query = (
             "mimeType = 'application/vnd.google-apps.folder' "
             f"and name = '{folder_name}' and trashed = false"
         )
-        result = (
-            service.files()
-            .list(q=query, spaces="drive", fields="files(id, name)", pageSize=20)
-            .execute()
-        )
-        return [item["id"] for item in result.get("files", [])]
+        folder_ids: list[str] = []
+        page_token: str | None = None
+        while True:
+            result = (
+                service.files()
+                .list(
+                    q=query,
+                    spaces="drive",
+                    fields="nextPageToken, files(id, name)",
+                    pageSize=100,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            folder_ids.extend(item["id"] for item in result.get("files", []) if item.get("id"))
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        return folder_ids
 
     def list_takeout_archives(self) -> list[DriveArchiveItem]:
         """List all Takeout archive files in the configured Google Drive Takeout folder."""
@@ -204,7 +249,7 @@ class GoogleDriveClient:
         on_progress: Callable[[float], None] | None = None,
         max_retries: int = 4,
     ) -> Path:
-        """Download a Drive file with chunked streaming and retry backoff."""
+        """Download a Drive file with chunked streaming, MD5 verification, and retry backoff."""
         service = self._build_service()
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
@@ -219,6 +264,15 @@ class GoogleDriveClient:
                         status, done = downloader.next_chunk(num_retries=3)
                         if status and on_progress:
                             on_progress(float(status.progress()) * 100.0)
+
+                if item.md5_checksum:
+                    actual_md5 = _compute_file_md5(tmp_path)
+                    if actual_md5.lower() != item.md5_checksum.strip().lower():
+                        raise ValueError(
+                            f"MD5 checksum mismatch for {item.name}: "
+                            f"expected {item.md5_checksum}, got {actual_md5}"
+                        )
+
                 os.replace(tmp_path, dest_path)
                 return dest_path
             except Exception as exc:

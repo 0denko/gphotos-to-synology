@@ -274,8 +274,11 @@
                 <label for="gdrive_post_action">After Verified Import</label>
                 <select id="gdrive_post_action" name="gdrive_post_action">
                   <option value="keep">Keep Archive in Drive (Read-Only Scope)</option>
-                  <option value="trash">Move Archive to Drive Trash (Reclaim Quota)</option>
+                  <option value="trash">Move Archive to Drive Trash (Requires Full Drive Scope)</option>
                 </select>
+                <small class="hint">
+                  Note: Moving archives to Trash requests full Google Drive scope on your next OAuth sign-in.
+                </small>
               </div>
             </div>
 
@@ -287,6 +290,9 @@
                 Disconnect
               </button>
             </div>
+            <small class="hint">
+              Disconnect removes the token from your NAS. To revoke Google's server-side grant, visit Google Account → Security → Third-party access.
+            </small>
           </div>
 
           <!-- Synology DSM 7 API Card -->
@@ -309,7 +315,10 @@
             <div class="row-2">
               <div class="field">
                 <label for="synology_url">DSM URL</label>
-                <input id="synology_url" name="synology_url" type="text" placeholder="http://172.17.0.1:5000" />
+                <input id="synology_url" name="synology_url" type="text" placeholder="https://127.0.0.1:5001" />
+                <small class="hint">
+                  Changing the DSM URL clears any saved DSM password until you re-enter it.
+                </small>
               </div>
               <div class="field">
                 <label for="synology_space">Synology Photos Space</label>
@@ -333,7 +342,7 @@
 
             <label class="checkbox-row">
               <input id="synology_verify_ssl" name="synology_verify_ssl" type="checkbox" />
-              <span>Verify HTTPS SSL certificate</span>
+              <span>Verify HTTPS SSL certificate (recommended; uncheck only for self-signed DSM certs)</span>
             </label>
 
             <div class="inline-actions">

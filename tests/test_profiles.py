@@ -25,15 +25,22 @@ def test_multi_user_discovery_profile_isolation_and_dsm_auto_select(tmp_path: Pa
         data_dir=tmp_path / "config",
         work_dir=tmp_path / "work",
         inbox_dir=tmp_path / "inbox",
-        photos_dir=tmp_path / "photo",
+        photos_dir=tmp_path / "photos",
         homes_dir=homes_dir,
         inbox_stability_seconds=0,
         min_free_disk_gb=0.1,
         write_exif_metadata=False,
+        proxy_secret="test-proxy-secret",
     )
     app = create_app(base_settings=settings, start_worker=False)
 
-    with TestClient(app) as client:
+    admin_headers = {
+        "X-Proxy-Secret": "test-proxy-secret",
+        "X-DSM-User": "admin",
+        "X-DSM-Admin": "1",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    with TestClient(app, headers=admin_headers) as client:
         # 1. Configure shared Google OAuth Client ID on default profile
         client.put(
             "/api/settings",
@@ -67,7 +74,7 @@ def test_multi_user_discovery_profile_isolation_and_dsm_auto_select(tmp_path: Pa
         assert maria_settings["google_client_id"] == "shared-client-id.apps.googleusercontent.com"
 
         # 4. Logged-in DSM user header auto-recommends Maria's profile
-        dsm_lookup = client.get("/api/profiles", headers={"X-DSM-User": "maria"}).json()
+        dsm_lookup = client.get("/api/profiles", headers={"X-DSM-User": "maria", "X-DSM-Admin": "0"}).json()
         assert dsm_lookup["current_dsm_user"] == "maria"
         assert dsm_lookup["recommended_profile_id"] == "maria"
 

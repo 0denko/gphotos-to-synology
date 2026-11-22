@@ -1,4 +1,4 @@
-"""FastAPI application factory, lifespan manager, and CLI entrypoint."""
+"""FastAPI application factory, lifespan manager, security middleware, and CLI entrypoint."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from gphotos_synology.database import StateDB
 from gphotos_synology.profiles import ProfileRegistry
 from gphotos_synology.updater import UpdateService
 from gphotos_synology.web.routes import create_api_router
+from gphotos_synology.web.security import SecurityMiddleware, load_or_create_api_token
 from gphotos_synology.worker.pipeline import MigrationPipeline
 from gphotos_synology.worker.scheduler import BackgroundScheduler
 
@@ -32,6 +33,7 @@ class AppContext:
     pipeline: MigrationPipeline
     scheduler: BackgroundScheduler
     updater: UpdateService
+    effective_api_token: str = ""
 
 
 def configure_logging() -> None:
@@ -58,6 +60,7 @@ def create_app(
         registry=registry,
     )
     updater = UpdateService()
+    effective_api_token = load_or_create_api_token(default_ctx.config_manager.settings)
     ctx = AppContext(
         registry=registry,
         config_manager=default_ctx.config_manager,
@@ -65,6 +68,7 @@ def create_app(
         pipeline=default_ctx.pipeline,
         scheduler=scheduler,
         updater=updater,
+        effective_api_token=effective_api_token,
     )
 
     @asynccontextmanager
@@ -83,6 +87,7 @@ def create_app(
         lifespan=lifespan,
     )
     fastapi_app.state.ctx = ctx
+    fastapi_app.add_middleware(SecurityMiddleware)
     fastapi_app.include_router(create_api_router())
 
     if STATIC_DIR.is_dir():

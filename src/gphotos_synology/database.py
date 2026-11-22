@@ -15,6 +15,46 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+_UNSET: Any = object()
+_HEX_CHARS = frozenset("0123456789abcdef")
+
+_DHASH_BUCKET_CANDIDATES_SQL = """
+SELECT m.*
+FROM media_items m
+WHERE m.id IN (
+    SELECT media_id FROM media_dhash_buckets WHERE bucket_idx = 0 AND bucket_val = ?
+    UNION
+    SELECT media_id FROM media_dhash_buckets WHERE bucket_idx = 1 AND bucket_val = ?
+    UNION
+    SELECT media_id FROM media_dhash_buckets WHERE bucket_idx = 2 AND bucket_val = ?
+    UNION
+    SELECT media_id FROM media_dhash_buckets WHERE bucket_idx = 3 AND bucket_val = ?
+    UNION
+    SELECT media_id FROM media_dhash_buckets WHERE bucket_idx = 4 AND bucket_val = ?
+    UNION
+    SELECT media_id FROM media_dhash_buckets WHERE bucket_idx = 5 AND bucket_val = ?
+    UNION
+    SELECT media_id FROM media_dhash_buckets WHERE bucket_idx = 6 AND bucket_val = ?
+    UNION
+    SELECT media_id FROM media_dhash_buckets WHERE bucket_idx = 7 AND bucket_val = ?
+)
+AND m.dhash != ?
+ORDER BY m.id ASC
+"""
+
+
+def _normalize_dhash(dhash: str) -> str:
+    return (dhash or "").strip().lower()
+
+
+def _is_valid_128bit_dhash(dhash: str) -> bool:
+    return len(dhash) == 32 and all(ch in _HEX_CHARS for ch in dhash)
+
+
+def _dhash_buckets(dhash: str) -> list[tuple[int, str]]:
+    return [(i, dhash[i * 4 : (i + 1) * 4]) for i in range(8)]
+
+
 SCHEMA_SQL = """
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -28,7 +68,7 @@ CREATE TABLE IF NOT EXISTS archives (
     batch_key TEXT NOT NULL DEFAULT '',        -- e.g. takeout-20261121T000000Z
     size_bytes INTEGER NOT NULL DEFAULT 0,
     checksum TEXT NOT NULL DEFAULT '',         -- Drive md5Checksum or local sha256
-    status TEXT NOT NULL DEFAULT 'pending',    -- pending | downloading | processing | completed | failed
+    status TEXT NOT NULL DEFAULT 'pending',    -- pending | downloading | processing | completed | completed_with_errors | failed
     total_files INTEGER NOT NULL DEFAULT 0,
     imported_files INTEGER NOT NULL DEFAULT 0,
     duplicate_files INTEGER NOT NULL DEFAULT 0,
@@ -50,6 +90,7 @@ CREATE TABLE IF NOT EXISTS media_items (
     height INTEGER NOT NULL DEFAULT 0,
     sharpness REAL NOT NULL DEFAULT 0.0,       -- Laplacian edge variance (clarity metric)
     quality_score REAL NOT NULL DEFAULT 0.0,
+    visual_status TEXT NOT NULL DEFAULT '',    -- ok | undecodable | skipped | ''
     origin TEXT NOT NULL DEFAULT 'takeout',    -- 'takeout' | 'existing_nas'
     original_filename TEXT NOT NULL,
     dest_rel_path TEXT NOT NULL,               -- Path relative to PHOTOS_DIR
@@ -69,10 +110,23 @@ CREATE INDEX IF NOT EXISTS idx_media_final_hash ON media_items(final_sha256);
 CREATE INDEX IF NOT EXISTS idx_media_pixel_hash ON media_items(pixel_sha256);
 CREATE INDEX IF NOT EXISTS idx_media_dhash ON media_items(dhash);
 
+CREATE TABLE IF NOT EXISTS media_dhash_buckets (
+    bucket_idx INTEGER NOT NULL,
+    bucket_val TEXT NOT NULL,
+    media_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+    PRIMARY KEY (bucket_idx, bucket_val, media_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_dhash_buckets_media_id ON media_dhash_buckets(media_id);
+
 CREATE TABLE IF NOT EXISTS quality_upgrades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     media_id INTEGER REFERENCES media_items(id) ON DELETE SET NULL,
     kept_rel_path TEXT NOT NULL,
+    old_rel_path TEXT NOT NULL DEFAULT '',
+    old_taken_at TEXT NOT NULL DEFAULT '',
+    old_latitude REAL,
+    old_longitude REAL,
     quarantine_filename TEXT NOT NULL,
     old_filename TEXT NOT NULL,
     new_filename TEXT NOT NULL,
@@ -86,7 +140,7 @@ CREATE TABLE IF NOT EXISTS quality_upgrades (
     new_sharpness REAL NOT NULL DEFAULT 0.0,
     match_reason TEXT NOT NULL DEFAULT '',
     upgrade_reason TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'quarantined', -- quarantined | restored | purged
+    status TEXT NOT NULL DEFAULT 'quarantined', -- in_progress | quarantined | restored | purged
     created_at TEXT NOT NULL,
     resolved_at TEXT
 );
@@ -132,10 +186,14 @@ CREATE TABLE IF NOT EXISTS app_state (
 class StateDB:
     """Thread-safe SQLite repository for migration state."""
 
+    _LOG_PRUNE_INTERVAL = 50
+
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._log_insert_count = 0
+        self._has_legacy_dhash = False
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -157,29 +215,109 @@ class StateDB:
             finally:
                 conn.close()
 
+    def _sync_dhash_buckets(
+        self, conn: sqlite3.Connection, media_id: int, dhash_norm: str
+    ) -> None:
+        conn.execute("DELETE FROM media_dhash_buckets WHERE media_id = ?", (media_id,))
+        if _is_valid_128bit_dhash(dhash_norm):
+            conn.executemany(
+                "INSERT INTO media_dhash_buckets (bucket_idx, bucket_val, media_id) VALUES (?, ?, ?)",
+                [(idx, val, media_id) for idx, val in _dhash_buckets(dhash_norm)],
+            )
+        elif dhash_norm:
+            self._has_legacy_dhash = True
+
     def _init_schema(self) -> None:
         with self.transaction() as conn:
             conn.executescript(SCHEMA_SQL)
             # Migrate existing databases smoothly if new columns were added
-            existing_cols = {
+            existing_media_cols = {
                 row["name"] for row in conn.execute("PRAGMA table_info(media_items)").fetchall()
             }
-            migrations = [
+            media_migrations = [
                 ("pixel_sha256", "TEXT NOT NULL DEFAULT ''"),
                 ("dhash", "TEXT NOT NULL DEFAULT ''"),
                 ("width", "INTEGER NOT NULL DEFAULT 0"),
                 ("height", "INTEGER NOT NULL DEFAULT 0"),
                 ("sharpness", "REAL NOT NULL DEFAULT 0.0"),
                 ("quality_score", "REAL NOT NULL DEFAULT 0.0"),
+                ("visual_status", "TEXT NOT NULL DEFAULT ''"),
                 ("origin", "TEXT NOT NULL DEFAULT 'takeout'"),
                 ("file_mtime_ns", "INTEGER NOT NULL DEFAULT 0"),
             ]
-            for col_name, col_def in migrations:
-                if col_name not in existing_cols:
+            for col_name, col_def in media_migrations:
+                if col_name not in existing_media_cols:
                     conn.execute(f"ALTER TABLE media_items ADD COLUMN {col_name} {col_def}")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_media_final_hash ON media_items(final_sha256)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_media_pixel_hash ON media_items(pixel_sha256)")
+
+            existing_upgrade_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(quality_upgrades)").fetchall()
+            }
+            upgrade_migrations = [
+                ("old_rel_path", "TEXT NOT NULL DEFAULT ''"),
+                ("old_taken_at", "TEXT NOT NULL DEFAULT ''"),
+                ("old_latitude", "REAL"),
+                ("old_longitude", "REAL"),
+            ]
+            for col_name, col_def in upgrade_migrations:
+                if col_name not in existing_upgrade_cols:
+                    conn.execute(f"ALTER TABLE quality_upgrades ADD COLUMN {col_name} {col_def}")
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_final_hash ON media_items(final_sha256)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_pixel_hash ON media_items(pixel_sha256)"
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_media_dhash ON media_items(dhash)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dhash_buckets_media_id ON media_dhash_buckets(media_id)"
+            )
+
+            # Normalize any uppercase dhash values before backfilling buckets
+            conn.execute("UPDATE media_items SET dhash = lower(dhash) WHERE dhash != lower(dhash)")
+
+            # Mark already-fingerprinted legacy rows as visual_status='ok' while leaving
+            # empty-visual rows (e.g. pre-v1.2.0 HEIC files) as '' so they get re-indexed once.
+            conn.execute(
+                """
+                UPDATE media_items
+                SET visual_status = 'ok'
+                WHERE visual_status = ''
+                  AND pixel_sha256 != ''
+                  AND length(dhash) = 32
+                  AND width > 0
+                """
+            )
+
+            # Idempotently backfill media_dhash_buckets for any 32-hex rows lacking buckets
+            missing_bucket_rows = conn.execute(
+                """
+                SELECT m.id, m.dhash
+                FROM media_items m
+                WHERE length(m.dhash) = 32
+                  AND NOT EXISTS (
+                      SELECT 1 FROM media_dhash_buckets b WHERE b.media_id = m.id
+                  )
+                """
+            ).fetchall()
+            bucket_inserts: list[tuple[int, str, int]] = []
+            for row in missing_bucket_rows:
+                dhash_norm = _normalize_dhash(str(row["dhash"]))
+                if _is_valid_128bit_dhash(dhash_norm):
+                    mid = int(row["id"])
+                    for idx, val in _dhash_buckets(dhash_norm):
+                        bucket_inserts.append((idx, val, mid))
+            if bucket_inserts:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO media_dhash_buckets (bucket_idx, bucket_val, media_id) VALUES (?, ?, ?)",
+                    bucket_inserts,
+                )
+
+            legacy_row = conn.execute(
+                "SELECT 1 FROM media_items WHERE dhash != '' AND length(dhash) != 32 LIMIT 1"
+            ).fetchone()
+            self._has_legacy_dhash = legacy_row is not None
 
     # ------------------------------------------------------------------
     # App state key-value helpers
@@ -201,6 +339,10 @@ class StateDB:
                 (key, value, now),
             )
 
+    def delete_state(self, key: str) -> None:
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM app_state WHERE key = ?", (key,))
+
     # ------------------------------------------------------------------
     # Activity logs
     # ------------------------------------------------------------------
@@ -211,15 +353,21 @@ class StateDB:
                 "INSERT INTO activity_logs (level, component, message, created_at) VALUES (?, ?, ?, ?)",
                 (level.upper(), component, message, now),
             )
-            conn.execute(
-                """
-                DELETE FROM activity_logs
-                WHERE id NOT IN (
-                    SELECT id FROM activity_logs ORDER BY id DESC LIMIT ?
-                )
-                """,
-                (max_rows,),
-            )
+            self._log_insert_count += 1
+            if self._log_insert_count % self._LOG_PRUNE_INTERVAL == 0:
+                if max_rows <= 0:
+                    conn.execute("DELETE FROM activity_logs")
+                else:
+                    conn.execute(
+                        """
+                        DELETE FROM activity_logs
+                        WHERE id < COALESCE(
+                            (SELECT id FROM activity_logs ORDER BY id DESC LIMIT 1 OFFSET ?),
+                            0
+                        )
+                        """,
+                        (max_rows - 1,),
+                    )
 
     def get_recent_logs(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.transaction() as conn:
@@ -250,33 +398,67 @@ class StateDB:
         size_bytes: int = 0,
         checksum: str = "",
         status: str = "pending",
+        error_message: str = "",
     ) -> int:
         now = utc_now_iso()
         with self.transaction() as conn:
             existing = conn.execute(
-                "SELECT id FROM archives WHERE source = ? AND source_id = ?",
+                "SELECT id, status FROM archives WHERE source = ? AND source_id = ?",
                 (source, source_id),
             ).fetchone()
             if existing:
-                conn.execute(
-                    """
-                    UPDATE archives
-                    SET filename = ?, batch_key = ?, size_bytes = ?, checksum = ?,
-                        status = ?, error_message = '', updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (filename, batch_key, size_bytes, checksum, status, now, existing["id"]),
-                )
+                if str(existing["status"]) != "completed":
+                    conn.execute(
+                        """
+                        UPDATE archives
+                        SET filename = ?, batch_key = ?, size_bytes = ?, checksum = ?,
+                            status = ?, total_files = 0, imported_files = 0,
+                            duplicate_files = 0, failed_files = 0,
+                            error_message = ?, completed_at = NULL, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            filename,
+                            batch_key,
+                            size_bytes,
+                            checksum,
+                            status,
+                            error_message,
+                            now,
+                            existing["id"],
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE archives
+                        SET filename = ?, batch_key = ?, size_bytes = ?, checksum = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (filename, batch_key, size_bytes, checksum, now, existing["id"]),
+                    )
                 return int(existing["id"])
             cursor = conn.execute(
                 """
                 INSERT INTO archives (
                     source, source_id, filename, batch_key, size_bytes, checksum,
-                    status, created_at, updated_at
+                    status, error_message, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (source, source_id, filename, batch_key, size_bytes, checksum, status, now, now),
+                (
+                    source,
+                    source_id,
+                    filename,
+                    batch_key,
+                    size_bytes,
+                    checksum,
+                    status,
+                    error_message,
+                    now,
+                    now,
+                ),
             )
             return int(cursor.lastrowid)
 
@@ -335,10 +517,31 @@ class StateDB:
     def get_media_by_original_hash(self, original_sha256: str) -> dict[str, Any] | None:
         with self.transaction() as conn:
             row = conn.execute(
-                "SELECT * FROM media_items WHERE original_sha256 = ? OR final_sha256 = ?",
-                (original_sha256, original_sha256),
+                """
+                SELECT * FROM media_items
+                WHERE original_sha256 = ? OR final_sha256 = ?
+                ORDER BY CASE WHEN original_sha256 = ? THEN 0 ELSE 1 END, id ASC
+                LIMIT 1
+                """,
+                (original_sha256, original_sha256, original_sha256),
             ).fetchone()
             return dict(row) if row else None
+
+    def get_media_by_id(self, media_id: int) -> dict[str, Any] | None:
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM media_items WHERE id = ?",
+                (media_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def delete_media_item(self, media_id: int) -> bool:
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "DELETE FROM media_items WHERE id = ?",
+                (media_id,),
+            )
+            return cursor.rowcount > 0
 
     def find_duplicate_media(
         self,
@@ -360,11 +563,18 @@ class StateDB:
         """
         from gphotos_synology.takeout.dedup import is_perceptual_match
 
+        dhash_norm = _normalize_dhash(dhash)
+
         with self.transaction() as conn:
             # Tier 1: Exact file SHA-256 (checks both raw original and EXIF-repaired final hashes)
             row = conn.execute(
-                "SELECT * FROM media_items WHERE original_sha256 = ? OR final_sha256 = ? LIMIT 1",
-                (sha256, sha256),
+                """
+                SELECT * FROM media_items
+                WHERE original_sha256 = ? OR final_sha256 = ?
+                ORDER BY CASE WHEN original_sha256 = ? THEN 0 ELSE 1 END, id ASC
+                LIMIT 1
+                """,
+                (sha256, sha256, sha256),
             ).fetchone()
             if row is not None:
                 return dict(row), "sha256"
@@ -375,21 +585,21 @@ class StateDB:
             # Tier 2: Exact decoded RGB pixel SHA-256 (catches EXIF/header differences, zero false positives)
             if pixel_sha256:
                 px_row = conn.execute(
-                    "SELECT * FROM media_items WHERE pixel_sha256 = ? LIMIT 1",
+                    "SELECT * FROM media_items WHERE pixel_sha256 = ? ORDER BY id ASC LIMIT 1",
                     (pixel_sha256,),
                 ).fetchone()
                 if px_row is not None:
                     return dict(px_row), "pixel_sha256"
 
             # Tier 3: Guarded 128-bit perceptual dHash+vHash match across resolutions & compression levels
-            if dedup_mode == "perceptual" and dhash:
+            if dedup_mode == "perceptual" and dhash_norm:
                 exact_dhash_rows = conn.execute(
-                    "SELECT * FROM media_items WHERE dhash = ?",
-                    (dhash,),
+                    "SELECT * FROM media_items WHERE dhash = ? ORDER BY id ASC",
+                    (dhash_norm,),
                 ).fetchall()
                 for cand in exact_dhash_rows:
                     if is_perceptual_match(
-                        dhash,
+                        dhash_norm,
                         str(cand["dhash"]),
                         incoming_taken_at=taken_at,
                         existing_taken_at=cand["taken_at"],
@@ -403,25 +613,74 @@ class StateDB:
                     ):
                         return dict(cand), "perceptual_dhash"
 
-                all_dhash_rows = conn.execute(
-                    "SELECT * FROM media_items WHERE dhash != '' AND dhash != ?",
-                    (dhash,),
-                ).fetchall()
-                for cand in all_dhash_rows:
-                    if is_perceptual_match(
-                        dhash,
-                        str(cand["dhash"]),
-                        incoming_taken_at=taken_at,
-                        existing_taken_at=cand["taken_at"],
-                        incoming_filename=filename,
-                        existing_filename=str(cand["original_filename"]),
-                        incoming_width=width,
-                        incoming_height=height,
-                        existing_width=int(cand["width"] or 0),
-                        existing_height=int(cand["height"] or 0),
-                        max_distance=perceptual_max_distance,
-                    ):
-                        return dict(cand), "perceptual_dhash"
+                if _is_valid_128bit_dhash(dhash_norm) and perceptual_max_distance < 8:
+                    # Pigeonhole principle: with 8 disjoint 16-bit blocks, any 128-bit hash
+                    # within Hamming distance <= 7 must share at least one exact 4-hex block.
+                    bucket_vals = [val for _, val in _dhash_buckets(dhash_norm)]
+                    candidate_rows = conn.execute(
+                        _DHASH_BUCKET_CANDIDATES_SQL,
+                        (*bucket_vals, dhash_norm),
+                    ).fetchall()
+                    for cand in candidate_rows:
+                        if is_perceptual_match(
+                            dhash_norm,
+                            str(cand["dhash"]),
+                            incoming_taken_at=taken_at,
+                            existing_taken_at=cand["taken_at"],
+                            incoming_filename=filename,
+                            existing_filename=str(cand["original_filename"]),
+                            incoming_width=width,
+                            incoming_height=height,
+                            existing_width=int(cand["width"] or 0),
+                            existing_height=int(cand["height"] or 0),
+                            max_distance=perceptual_max_distance,
+                        ):
+                            return dict(cand), "perceptual_dhash"
+
+                    if self._has_legacy_dhash:
+                        legacy_rows = conn.execute(
+                            """
+                            SELECT * FROM media_items
+                            WHERE dhash != '' AND length(dhash) != 32 AND dhash != ?
+                            ORDER BY id ASC
+                            """,
+                            (dhash_norm,),
+                        ).fetchall()
+                        for cand in legacy_rows:
+                            if is_perceptual_match(
+                                dhash_norm,
+                                str(cand["dhash"]),
+                                incoming_taken_at=taken_at,
+                                existing_taken_at=cand["taken_at"],
+                                incoming_filename=filename,
+                                existing_filename=str(cand["original_filename"]),
+                                incoming_width=width,
+                                incoming_height=height,
+                                existing_width=int(cand["width"] or 0),
+                                existing_height=int(cand["height"] or 0),
+                                max_distance=perceptual_max_distance,
+                            ):
+                                return dict(cand), "perceptual_dhash"
+                else:
+                    all_dhash_rows = conn.execute(
+                        "SELECT * FROM media_items WHERE dhash != '' AND dhash != ? ORDER BY id ASC",
+                        (dhash_norm,),
+                    ).fetchall()
+                    for cand in all_dhash_rows:
+                        if is_perceptual_match(
+                            dhash_norm,
+                            str(cand["dhash"]),
+                            incoming_taken_at=taken_at,
+                            existing_taken_at=cand["taken_at"],
+                            incoming_filename=filename,
+                            existing_filename=str(cand["original_filename"]),
+                            incoming_width=width,
+                            incoming_height=height,
+                            existing_width=int(cand["width"] or 0),
+                            existing_height=int(cand["height"] or 0),
+                            max_distance=perceptual_max_distance,
+                        ):
+                            return dict(cand), "perceptual_dhash"
 
         return None, None
 
@@ -430,20 +689,29 @@ class StateDB:
         with self.transaction() as conn:
             rows = conn.execute(
                 """
-                SELECT id, dest_rel_path, file_size, file_mtime_ns, pixel_sha256, dhash, width, origin
+                SELECT id, dest_rel_path, file_size, file_mtime_ns,
+                       pixel_sha256, dhash, width, visual_status, origin
                 FROM media_items
                 """
             ).fetchall()
-            return {
-                str(r["dest_rel_path"]): {
+            result: dict[str, dict[str, Any]] = {}
+            for r in rows:
+                has_visual = (
+                    bool(r["pixel_sha256"])
+                    and len(str(r["dhash"] or "")) == 32
+                    and int(r["width"] or 0) > 0
+                )
+                visual_status = str(r["visual_status"] or "")
+                result[str(r["dest_rel_path"])] = {
                     "id": int(r["id"]),
                     "file_size": int(r["file_size"]),
                     "file_mtime_ns": int(r["file_mtime_ns"]),
-                    "has_visual": bool(r["pixel_sha256"]) and len(str(r["dhash"] or "")) == 32 and int(r["width"] or 0) > 0,
+                    "has_visual": has_visual,
+                    "visual_status": visual_status,
+                    "visual_done": has_visual or visual_status in ("ok", "undecodable"),
                     "origin": str(r["origin"]),
                 }
-                for r in rows
-            }
+            return result
 
     def upsert_existing_nas_media(
         self,
@@ -455,6 +723,7 @@ class StateDB:
         height: int = 0,
         sharpness: float = 0.0,
         quality_score: float = 0.0,
+        visual_status: str = "",
         filename: str,
         dest_rel_path: str,
         file_size: int,
@@ -463,12 +732,14 @@ class StateDB:
     ) -> int:
         """Index an existing photo/video already present on the Synology NAS."""
         now = utc_now_iso()
+        dhash_norm = _normalize_dhash(dhash)
         with self.transaction() as conn:
             by_path = conn.execute(
                 "SELECT id FROM media_items WHERE dest_rel_path = ?",
                 (dest_rel_path,),
             ).fetchone()
             if by_path:
+                media_id = int(by_path["id"])
                 conn.execute(
                     """
                     UPDATE media_items
@@ -479,6 +750,10 @@ class StateDB:
                         height = CASE WHEN ? > 0 THEN ? ELSE height END,
                         sharpness = CASE WHEN ? > 0 THEN ? ELSE sharpness END,
                         quality_score = CASE WHEN ? > 0 THEN ? ELSE quality_score END,
+                        visual_status = CASE
+                            WHEN ? != '' AND (? != 'skipped' OR visual_status = '') THEN ?
+                            ELSE visual_status
+                        END,
                         file_size = ?,
                         file_mtime_ns = ?,
                         taken_at = COALESCE(taken_at, ?)
@@ -488,8 +763,8 @@ class StateDB:
                         sha256,
                         pixel_sha256,
                         pixel_sha256,
-                        dhash,
-                        dhash,
+                        dhash_norm,
+                        dhash_norm,
                         width,
                         width,
                         height,
@@ -498,17 +773,27 @@ class StateDB:
                         sharpness,
                         quality_score,
                         quality_score,
+                        visual_status,
+                        visual_status,
+                        visual_status,
                         file_size,
                         file_mtime_ns,
                         taken_at,
-                        by_path["id"],
+                        media_id,
                     ),
                 )
-                return int(by_path["id"])
+                if dhash_norm != "":
+                    self._sync_dhash_buckets(conn, media_id, dhash_norm)
+                return media_id
 
             by_hash = conn.execute(
-                "SELECT id FROM media_items WHERE original_sha256 = ? OR final_sha256 = ?",
-                (sha256, sha256),
+                """
+                SELECT id FROM media_items
+                WHERE original_sha256 = ? OR final_sha256 = ?
+                ORDER BY CASE WHEN original_sha256 = ? THEN 0 ELSE 1 END, id ASC
+                LIMIT 1
+                """,
+                (sha256, sha256, sha256),
             ).fetchone()
             if by_hash:
                 return int(by_hash["id"])
@@ -517,21 +802,22 @@ class StateDB:
                 """
                 INSERT INTO media_items (
                     original_sha256, final_sha256, pixel_sha256, dhash,
-                    width, height, sharpness, quality_score, origin,
+                    width, height, sharpness, quality_score, visual_status, origin,
                     original_filename, dest_rel_path, file_size, file_mtime_ns,
                     taken_at, exif_status, source_archive_id, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'existing_nas', ?, ?, ?, ?, ?, 'existing', NULL, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'existing_nas', ?, ?, ?, ?, ?, 'existing', NULL, ?)
                 """,
                 (
                     sha256,
                     sha256,
                     pixel_sha256,
-                    dhash,
+                    dhash_norm,
                     width,
                     height,
                     sharpness,
                     quality_score,
+                    visual_status,
                     filename,
                     dest_rel_path,
                     file_size,
@@ -540,7 +826,9 @@ class StateDB:
                     now,
                 ),
             )
-            return int(cursor.lastrowid)
+            media_id = int(cursor.lastrowid)
+            self._sync_dhash_buckets(conn, media_id, dhash_norm)
+            return media_id
 
     def prune_missing_existing_nas_media(self, present_rel_paths: set[str]) -> int:
         """Delete stale existing_nas index rows for files that were removed from the NAS."""
@@ -579,29 +867,32 @@ class StateDB:
         sharpness: float = 0.0,
         quality_score: float = 0.0,
         file_mtime_ns: int = 0,
+        visual_status: str = "",
     ) -> int:
         now = utc_now_iso()
+        dhash_norm = _normalize_dhash(dhash)
         with self.transaction() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO media_items (
                     original_sha256, final_sha256, pixel_sha256, dhash,
-                    width, height, sharpness, quality_score, origin,
+                    width, height, sharpness, quality_score, visual_status, origin,
                     original_filename, dest_rel_path, file_size, file_mtime_ns,
                     taken_at, latitude, longitude, exif_status,
                     source_archive_id, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'takeout', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'takeout', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     original_sha256,
                     final_sha256,
                     pixel_sha256,
-                    dhash,
+                    dhash_norm,
                     width,
                     height,
                     sharpness,
                     quality_score,
+                    visual_status,
                     original_filename,
                     dest_rel_path,
                     file_size,
@@ -614,7 +905,9 @@ class StateDB:
                     now,
                 ),
             )
-            return int(cursor.lastrowid)
+            media_id = int(cursor.lastrowid)
+            self._sync_dhash_buckets(conn, media_id, dhash_norm)
+            return media_id
 
     def upgrade_media_item(
         self,
@@ -634,6 +927,9 @@ class StateDB:
         file_mtime_ns: int,
         taken_at: str | None,
         exif_status: str,
+        visual_status: str | None = None,
+        latitude: float | None = _UNSET,
+        longitude: float | None = _UNSET,
     ) -> None:
         """Replace an existing media_items record in place with a higher-quality image.
 
@@ -641,45 +937,57 @@ class StateDB:
         Synology item sync status so DSM 7 API re-binds the upgraded photo.
         """
         now = utc_now_iso()
+        dhash_norm = _normalize_dhash(dhash)
+        set_clauses = [
+            "original_sha256 = ?",
+            "final_sha256 = ?",
+            "pixel_sha256 = ?",
+            "dhash = ?",
+            "width = ?",
+            "height = ?",
+            "sharpness = ?",
+            "quality_score = ?",
+            "original_filename = ?",
+            "dest_rel_path = ?",
+            "file_size = ?",
+            "file_mtime_ns = ?",
+            "taken_at = COALESCE(?, taken_at)",
+            "exif_status = ?",
+            "synology_item_id = NULL",
+        ]
+        params: list[Any] = [
+            original_sha256,
+            final_sha256,
+            pixel_sha256,
+            dhash_norm,
+            width,
+            height,
+            sharpness,
+            quality_score,
+            original_filename,
+            dest_rel_path,
+            file_size,
+            file_mtime_ns,
+            taken_at,
+            exif_status,
+        ]
+        if visual_status is not None:
+            set_clauses.append("visual_status = ?")
+            params.append(visual_status)
+        if latitude is not _UNSET:
+            set_clauses.append("latitude = ?")
+            params.append(latitude)
+        if longitude is not _UNSET:
+            set_clauses.append("longitude = ?")
+            params.append(longitude)
+        params.append(media_id)
+
         with self.transaction() as conn:
             conn.execute(
-                """
-                UPDATE media_items
-                SET original_sha256 = ?,
-                    final_sha256 = ?,
-                    pixel_sha256 = ?,
-                    dhash = ?,
-                    width = ?,
-                    height = ?,
-                    sharpness = ?,
-                    quality_score = ?,
-                    original_filename = ?,
-                    dest_rel_path = ?,
-                    file_size = ?,
-                    file_mtime_ns = ?,
-                    taken_at = COALESCE(?, taken_at),
-                    exif_status = ?,
-                    synology_item_id = NULL
-                WHERE id = ?
-                """,
-                (
-                    original_sha256,
-                    final_sha256,
-                    pixel_sha256,
-                    dhash,
-                    width,
-                    height,
-                    sharpness,
-                    quality_score,
-                    original_filename,
-                    dest_rel_path,
-                    file_size,
-                    file_mtime_ns,
-                    taken_at,
-                    exif_status,
-                    media_id,
-                ),
+                f"UPDATE media_items SET {', '.join(set_clauses)} WHERE id = ?",
+                params,
             )
+            self._sync_dhash_buckets(conn, media_id, dhash_norm)
             conn.execute(
                 """
                 UPDATE album_memberships
@@ -717,23 +1025,32 @@ class StateDB:
         new_sharpness: float,
         match_reason: str,
         upgrade_reason: str,
+        old_rel_path: str = "",
+        old_taken_at: str = "",
+        old_latitude: float | None = None,
+        old_longitude: float | None = None,
     ) -> int:
         now = utc_now_iso()
         with self.transaction() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO quality_upgrades (
-                    media_id, kept_rel_path, quarantine_filename,
+                    media_id, kept_rel_path, old_rel_path, old_taken_at,
+                    old_latitude, old_longitude, quarantine_filename,
                     old_filename, new_filename,
                     old_width, old_height, old_file_size, old_sharpness,
                     new_width, new_height, new_file_size, new_sharpness,
                     match_reason, upgrade_reason, status, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'quarantined', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'quarantined', ?)
                 """,
                 (
                     media_id,
                     kept_rel_path,
+                    old_rel_path,
+                    old_taken_at,
+                    old_latitude,
+                    old_longitude,
                     quarantine_filename,
                     old_filename,
                     new_filename,
@@ -752,12 +1069,130 @@ class StateDB:
             )
             return int(cursor.lastrowid)
 
-    def list_quality_upgrades(self, limit: int = 100) -> list[dict[str, Any]]:
+    def create_pending_quality_upgrade(
+        self,
+        *,
+        media_id: int,
+        quarantine_filename: str,
+        old_rel_path: str,
+        old_filename: str,
+        new_filename: str,
+        old_width: int,
+        old_height: int,
+        old_file_size: int,
+        old_sharpness: float,
+        new_width: int,
+        new_height: int,
+        new_file_size: int,
+        new_sharpness: float,
+        match_reason: str,
+        upgrade_reason: str,
+        kept_rel_path: str = "",
+        old_taken_at: str = "",
+        old_latitude: float | None = None,
+        old_longitude: float | None = None,
+    ) -> int:
+        """Create a write-ahead 'in_progress' quality upgrade journal row prior to disk swap."""
+        now = utc_now_iso()
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO quality_upgrades (
+                    media_id, kept_rel_path, old_rel_path, old_taken_at,
+                    old_latitude, old_longitude, quarantine_filename,
+                    old_filename, new_filename,
+                    old_width, old_height, old_file_size, old_sharpness,
+                    new_width, new_height, new_file_size, new_sharpness,
+                    match_reason, upgrade_reason, status, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?)
+                """,
+                (
+                    media_id,
+                    kept_rel_path,
+                    old_rel_path,
+                    old_taken_at,
+                    old_latitude,
+                    old_longitude,
+                    quarantine_filename,
+                    old_filename,
+                    new_filename,
+                    old_width,
+                    old_height,
+                    old_file_size,
+                    old_sharpness,
+                    new_width,
+                    new_height,
+                    new_file_size,
+                    new_sharpness,
+                    match_reason,
+                    upgrade_reason,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def finalize_quality_upgrade(
+        self,
+        upgrade_id: int,
+        kept_rel_path: str,
+        *,
+        new_file_size: int | None = None,
+    ) -> None:
+        """Transition an 'in_progress' quality upgrade journal entry to 'quarantined'."""
+        with self.transaction() as conn:
+            if new_file_size is not None:
+                conn.execute(
+                    """
+                    UPDATE quality_upgrades
+                    SET status = 'quarantined', kept_rel_path = ?, new_file_size = ?
+                    WHERE id = ? AND status = 'in_progress'
+                    """,
+                    (kept_rel_path, new_file_size, upgrade_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE quality_upgrades
+                    SET status = 'quarantined', kept_rel_path = ?
+                    WHERE id = ? AND status = 'in_progress'
+                    """,
+                    (kept_rel_path, upgrade_id),
+                )
+
+    def delete_quality_upgrade(self, upgrade_id: int) -> None:
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM quality_upgrades WHERE id = ?", (upgrade_id,))
+
+    def list_in_progress_quality_upgrades(self) -> list[dict[str, Any]]:
         with self.transaction() as conn:
             rows = conn.execute(
-                "SELECT * FROM quality_upgrades ORDER BY id DESC LIMIT ?",
+                "SELECT * FROM quality_upgrades WHERE status = 'in_progress' ORDER BY id ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_quarantined_upgrades_batch(self, limit: int = 500) -> list[dict[str, Any]]:
+        with self.transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM quality_upgrades WHERE status = 'quarantined' ORDER BY id ASC LIMIT ?",
                 (limit,),
             ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_quality_upgrades(
+        self, limit: int = 100, *, include_in_progress: bool = False
+    ) -> list[dict[str, Any]]:
+        with self.transaction() as conn:
+            if include_in_progress:
+                rows = conn.execute(
+                    "SELECT * FROM quality_upgrades ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM quality_upgrades WHERE status != 'in_progress' ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
             return [dict(r) for r in rows]
 
     def get_quality_upgrade(self, upgrade_id: int) -> dict[str, Any] | None:
@@ -794,8 +1229,14 @@ class StateDB:
 
             conn.execute(
                 """
-                INSERT OR IGNORE INTO album_memberships (album_id, media_id, sync_status, updated_at)
+                INSERT INTO album_memberships (album_id, media_id, sync_status, updated_at)
                 VALUES (?, ?, 'pending', ?)
+                ON CONFLICT(album_id, media_id) DO UPDATE SET
+                    sync_status = 'pending',
+                    retry_count = 0,
+                    last_error = '',
+                    updated_at = excluded.updated_at
+                WHERE album_memberships.sync_status = 'error'
                 """,
                 (album_id, media_id, now),
             )
@@ -834,7 +1275,13 @@ class StateDB:
             return [dict(r) for r in rows]
 
     def mark_album_membership(
-        self, album_id: int, media_id: int, *, status: str, error: str = ""
+        self,
+        album_id: int,
+        media_id: int,
+        *,
+        status: str,
+        error: str = "",
+        increment_retry: bool | None = None,
     ) -> None:
         now = utc_now_iso()
         with self.transaction() as conn:
@@ -848,15 +1295,28 @@ class StateDB:
                     (now, album_id, media_id),
                 )
             else:
-                conn.execute(
-                    """
-                    UPDATE album_memberships
-                    SET sync_status = ?, retry_count = retry_count + 1,
-                        last_error = ?, updated_at = ?
-                    WHERE album_id = ? AND media_id = ?
-                    """,
-                    (status, error, now, album_id, media_id),
+                should_increment = (
+                    (status == "error") if increment_retry is None else increment_retry
                 )
+                if should_increment:
+                    conn.execute(
+                        """
+                        UPDATE album_memberships
+                        SET sync_status = ?, retry_count = retry_count + 1,
+                            last_error = ?, updated_at = ?
+                        WHERE album_id = ? AND media_id = ?
+                        """,
+                        (status, error, now, album_id, media_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE album_memberships
+                        SET sync_status = ?, last_error = ?, updated_at = ?
+                        WHERE album_id = ? AND media_id = ?
+                        """,
+                        (status, error, now, album_id, media_id),
+                    )
 
     def list_albums_summary(self) -> list[dict[str, Any]]:
         with self.transaction() as conn:
@@ -898,6 +1358,7 @@ class StateDB:
                 SELECT
                     COUNT(*) AS total_archives,
                     SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_archives,
+                    SUM(CASE WHEN status = 'completed_with_errors' THEN 1 ELSE 0 END) AS completed_with_errors_archives,
                     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_archives,
                     COALESCE(SUM(duplicate_files), 0) AS total_duplicates_skipped
                 FROM archives
@@ -915,7 +1376,7 @@ class StateDB:
             upgrade_row = conn.execute(
                 """
                 SELECT
-                    COUNT(*) AS total_upgrades,
+                    SUM(CASE WHEN status != 'in_progress' THEN 1 ELSE 0 END) AS total_upgrades,
                     SUM(CASE WHEN status = 'quarantined' THEN 1 ELSE 0 END) AS quarantined_count
                 FROM quality_upgrades
                 """
@@ -923,12 +1384,16 @@ class StateDB:
 
             return {
                 "total_media": int(media_row["migrated_media"] or 0),
+                "takeout_media": int(media_row["migrated_media"] or 0),
                 "existing_nas_indexed": int(media_row["existing_nas_indexed"] or 0),
                 "total_library_items": int(media_row["total_library_items"] or 0),
                 "total_bytes": int(media_row["migrated_bytes"] or 0),
                 "exif_repaired": int(media_row["exif_repaired"] or 0),
                 "total_archives": int(archive_row["total_archives"] or 0),
                 "completed_archives": int(archive_row["completed_archives"] or 0),
+                "completed_with_errors_archives": int(
+                    archive_row["completed_with_errors_archives"] or 0
+                ),
                 "failed_archives": int(archive_row["failed_archives"] or 0),
                 "total_duplicates_skipped": int(archive_row["total_duplicates_skipped"] or 0),
                 "total_albums": int(album_row["total_albums"] or 0),

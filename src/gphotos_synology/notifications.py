@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import smtplib
+import threading
 from email.message import EmailMessage
 
 import httpx
@@ -14,13 +15,13 @@ logger = logging.getLogger(__name__)
 
 
 class Notifier:
-    """Dispatches non-blocking operational alerts to configured channels."""
+    """Dispatches synchronous or non-blocking operational alerts to configured channels."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
     def send(self, title: str, message: str, *, level: str = "info") -> bool:
-        """Send notification to configured webhook and/or SMTP recipients."""
+        """Synchronously send notification to configured webhook and/or SMTP recipients."""
         delivered = False
         if self.settings.webhook_url.strip():
             delivered = self._send_webhook(title, message, level=level) or delivered
@@ -28,11 +29,34 @@ class Notifier:
             delivered = self._send_email(title, message) or delivered
         return delivered
 
+    def send_async(self, title: str, message: str, *, level: str = "info") -> None:
+        """Dispatch a notification on a background daemon thread without blocking the worker."""
+        if not self.settings.webhook_url.strip() and not (
+            self.settings.smtp_host.strip() and self.settings.smtp_to.strip()
+        ):
+            return
+
+        def _worker() -> None:
+            try:
+                self.send(title, message, level=level)
+            except Exception as exc:
+                logger.warning("Async notification delivery failed: %s", exc)
+
+        threading.Thread(
+            target=_worker,
+            name="gphotos-notifier",
+            daemon=True,
+        ).start()
+
     def _send_webhook(self, title: str, message: str, *, level: str) -> bool:
         url = self.settings.webhook_url.strip()
         wtype = self.settings.webhook_type
+        from urllib.parse import urlsplit
+
+        parsed_host = (urlsplit(url).hostname or "").lower()
+        is_loopback = parsed_host in {"127.0.0.1", "localhost", "::1"}
         try:
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=15.0, trust_env=not is_loopback) as client:
                 if wtype == "ntfy":
                     priority = "high" if level == "error" else "default"
                     resp = client.post(

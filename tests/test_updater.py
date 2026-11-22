@@ -25,16 +25,16 @@ def test_update_checker_detects_new_commit_and_up_to_date() -> None:
             return httpx.Response(
                 200,
                 json={
-                    "tag_name": "v1.0.1",
-                    "html_url": "https://github.com/0denko/gphotos-to-synology/releases/tag/v1.0.1",
+                    "tag_name": "v1.3.0",
+                    "html_url": "https://github.com/0denko/gphotos-to-synology/releases/tag/v1.3.0",
                     "assets": [
                         {
                             "name": "gphotos-migrator-dsm7-arm64.spk",
-                            "browser_download_url": "https://github.com/0denko/gphotos-to-synology/releases/download/v1.0.1/gphotos-migrator-dsm7-arm64.spk",
+                            "browser_download_url": "https://github.com/0denko/gphotos-to-synology/releases/download/v1.3.0/gphotos-migrator-dsm7-arm64.spk",
                         },
                         {
                             "name": "gphotos-migrator-dsm7-x86_64.spk",
-                            "browser_download_url": "https://github.com/0denko/gphotos-to-synology/releases/download/v1.0.1/gphotos-migrator-dsm7-x86_64.spk",
+                            "browser_download_url": "https://github.com/0denko/gphotos-to-synology/releases/download/v1.3.0/gphotos-migrator-dsm7-x86_64.spk",
                         },
                     ],
                 },
@@ -44,7 +44,7 @@ def test_update_checker_detects_new_commit_and_up_to_date() -> None:
     mock_client = httpx.Client(transport=httpx.MockTransport(handler))
     updater = UpdateService(cache_ttl_seconds=0)
 
-    # Older running SHA -> update_available=True
+    # Strictly newer release v1.3.0 > current 1.2.0 -> update_available=True
     old_settings = Settings(
         app_build_sha="1111111",
         watchtower_url="http://updater:8080",
@@ -54,17 +54,25 @@ def test_update_checker_detects_new_commit_and_up_to_date() -> None:
     assert res["update_available"] is True
     assert res["current_sha"] == "1111111"
     assert res["latest_sha"] == "abcdef1"
-    assert res["latest_version"] == "1.0.1"
+    assert res["latest_version"] == "1.3.0"
     assert res["latest_commit_message"] == "Add visual quality upgrade"
     assert res["auto_updater_configured"] is True
     assert res["spk_download_url"].endswith(".spk")
     assert ("arm64" in res["spk_download_url"]) or ("x86_64" in res["spk_download_url"])
-
-    # Matching SHA -> update_available=False
-    current_settings = Settings(app_build_sha="abcdef1234567890")
-    res2 = updater.get_status(current_settings, force=True, http_client=mock_client)
-    assert res2["update_available"] is False
     mock_client.close()
+
+    # Older release v1.0.1 < current 1.2.0 -> update_available=False (never downgrades)
+    def older_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/commits/main"):
+            return httpx.Response(200, json={"sha": "abcdef1234567890", "commit": {"message": "old", "committer": {"date": "2026-11-21T21:00:00Z"}}})
+        if request.url.path.endswith("/releases/latest"):
+            return httpx.Response(200, json={"tag_name": "v1.0.1", "html_url": "https://example.com", "assets": []})
+        return httpx.Response(404)
+
+    older_client = httpx.Client(transport=httpx.MockTransport(older_handler))
+    res2 = updater.get_status(old_settings, force=True, http_client=older_client)
+    assert res2["update_available"] is False
+    older_client.close()
 
 
 def test_watchtower_self_update_trigger() -> None:

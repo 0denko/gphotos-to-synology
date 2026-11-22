@@ -7,12 +7,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,12 +25,15 @@ jobs:
 
       - name: Install dependencies & run tests
         run: |
-          pip install -e ".[dev]"
-          ruff check src tests
-          pytest -v
+          pip install --no-cache-dir uv
+          uv sync --locked --extra dev
+          uv run ruff check src tests
+          uv run pytest -v
 
   build-standalone-spk:
     needs: test
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -47,17 +51,20 @@ jobs:
 
       - name: Build glibc-2.17 standalone binary & native DSM 7 SPK (${{ matrix.arch }})
         run: |
+          COMMIT_TS="$(git show -s --format=%ct HEAD)"
+          COMMIT_ISO="$(git show -s --format=%cI HEAD)"
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             -e APP_BUILD_SHA="${{ github.sha }}" \
+            -e APP_BUILD_DATE="${COMMIT_ISO}" \
+            -e SOURCE_DATE_EPOCH="${COMMIT_TS}" \
             ${{ matrix.manylinux }} \
             /bin/bash -euxo pipefail -c '
-              # Install uv and use a managed Python 3.12 (python-build-standalone)
-              # which ships shared libpython3.12.so (required by PyInstaller) and targets glibc 2.17.
               /opt/python/cp312-cp312/bin/pip install --no-cache-dir uv
               /opt/python/cp312-cp312/bin/uv venv --python 3.12 --python-preference only-managed /tmp/build-venv
-              /opt/python/cp312-cp312/bin/uv pip install --python /tmp/build-venv/bin/python --only-binary :all: -r pyproject.toml pyinstaller
+              /opt/python/cp312-cp312/bin/uv export --locked --no-dev --no-emit-project --no-hashes --output-file /tmp/reqs.txt
+              /opt/python/cp312-cp312/bin/uv pip install --python /tmp/build-venv/bin/python --only-binary :all: -r /tmp/reqs.txt pyinstaller
               /opt/python/cp312-cp312/bin/uv pip install --python /tmp/build-venv/bin/python --no-deps .
 
               /tmp/build-venv/bin/python -m PyInstaller \
@@ -73,11 +80,14 @@ jobs:
                 --hidden-import uvicorn.lifespan.on \
                 --collect-all googleapiclient \
                 --collect-all google_auth_oauthlib \
+                --collect-all pillow_heif \
                 synology-spk/entrypoint_bin.py
 
               # Smoke test the compiled standalone binary directly inside manylinux2014
               mkdir -p /tmp/smoke/config /tmp/smoke/work /tmp/smoke/inbox /tmp/smoke/photos
+              printf "smoke-proxy-secret" > /tmp/smoke/proxy.secret
               DATA_DIR=/tmp/smoke/config WORK_DIR=/tmp/smoke/work INBOX_DIR=/tmp/smoke/inbox PHOTOS_DIR=/tmp/smoke/photos \
+                PROXY_SECRET_FILE=/tmp/smoke/proxy.secret \
                 APP_HOST=127.0.0.1 APP_PORT=18765 dist/gphotos-migrator/gphotos-migrator > /tmp/smoke/app.log 2>&1 &
               SMOKE_PID=$!
               for _ in $(seq 1 30); do
@@ -89,31 +99,44 @@ jobs:
               done
               curl -sf http://127.0.0.1:18765/api/health | grep -q "\"status\":\"ok\"" || { cat /tmp/smoke/app.log; exit 1; }
               curl -sf http://127.0.0.1:18765/ | grep -q "Google Photos" || { cat /tmp/smoke/app.log; exit 1; }
+              # Verify C1 auth gate rejects unauthenticated /api/status with 401
+              HTTP_CODE="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18765/api/status)"
+              test "$HTTP_CODE" = "401" || { echo "Expected 401 on unauthenticated /api/status, got $HTTP_CODE"; exit 1; }
+              # Verify authenticated proxy request succeeds
+              curl -sf -H "X-Proxy-Secret: smoke-proxy-secret" -H "X-DSM-User: admin" -H "X-DSM-Admin: 1" \
+                http://127.0.0.1:18765/api/status | grep -q "photos_dir_writable" || { cat /tmp/smoke/app.log; exit 1; }
               kill "$SMOKE_PID" || true
               wait "$SMOKE_PID" 2>/dev/null || true
 
               /tmp/build-venv/bin/python synology-spk/build_spk.py \
                 --arch ${{ matrix.arch }} \
                 --bundle-dir dist/gphotos-migrator \
-                --build-sha "${APP_BUILD_SHA}"
+                --build-sha "${APP_BUILD_SHA}" \
+                --build-date "${APP_BUILD_DATE}"
             '
 
-      - name: Upload standalone SPK to GitHub Release v1.0.0
+      - name: Generate SHA-256 checksum & upload to versioned GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          TAG="${{ github.ref_name }}"
           SPK="dist/gphotos-migrator-dsm7-${{ matrix.arch }}.spk"
-          ls -lh "$SPK"
-          if gh release view v1.0.0 >/dev/null 2>&1; then
-            gh release upload v1.0.0 "$SPK" --clobber
+          (cd dist && sha256sum "$(basename "$SPK")" > "$(basename "$SPK").sha256")
+          ls -lh "$SPK" "${SPK}.sha256"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$SPK" "${SPK}.sha256" --clobber
           else
-            gh release create v1.0.0 "$SPK" \
-              --title "v1.1.0 — All-in-One Native Synology DSM 7 App (Zero Docker / Zero YAML)" \
-              --notes "Download the .spk for your Synology NAS CPU (x86_64 for Intel/AMD Plus models, arm64 for ARM models) and install via Package Center -> Manual Install."
+            gh release create "$TAG" "$SPK" "${SPK}.sha256" \
+              --title "${TAG} — All-in-One Native Synology DSM 7 App (Zero Docker / Zero YAML)" \
+              --notes "Download the standalone .spk for your Synology NAS CPU and verify against the published .sha256 checksum before installing via Package Center → Manual Install."
           fi
 
   publish-docker:
     needs: test
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

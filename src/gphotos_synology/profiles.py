@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import shutil
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -16,7 +19,10 @@ from gphotos_synology.config import ConfigManager, Settings
 from gphotos_synology.database import StateDB
 from gphotos_synology.worker.pipeline import MigrationPipeline
 
+logger = logging.getLogger(__name__)
+
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,48}$")
+RESERVED_PROFILE_IDS: set[str] = {"default", "processed", "profiles"}
 
 IGNORED_HOME_DIRS: set[str] = {
     "@eaDir",
@@ -67,6 +73,22 @@ def _slugify(raw: str) -> str:
     return cleaned[:48] or "user"
 
 
+def _resolve_contained_subfolder(base_dir: Path, custom_sub: str) -> Path:
+    """Resolve `base_dir / custom_sub` and verify strict containment within `base_dir` (G14)."""
+    if not custom_sub:
+        return base_dir.resolve()
+    if "\\" in custom_sub or custom_sub.startswith("/"):
+        raise ValueError("Invalid subfolder path.")
+    sub_path = Path(custom_sub)
+    if sub_path.is_absolute() or ".." in sub_path.parts:
+        raise ValueError("Invalid subfolder path.")
+    resolved_base = base_dir.resolve()
+    resolved_target = (resolved_base / sub_path).resolve()
+    if resolved_target != resolved_base and resolved_base not in resolved_target.parents:
+        raise ValueError("Invalid subfolder path.")
+    return resolved_target
+
+
 class ProfileRegistry:
     """Manages per-user Synology migration profiles with isolated Google tokens & dedup DBs."""
 
@@ -94,48 +116,81 @@ class ProfileRegistry:
             is_default=True,
         )
 
+    def _backup_corrupt_profiles(self, exc: Exception) -> None:
+        ts = int(time.time())
+        backup = self._profiles_path.with_name(f"profiles.json.corrupt.{ts}")
+        try:
+            shutil.copy2(self._profiles_path, backup)
+            logger.error(
+                "Corrupt profiles.json backed up to %s (%s); reinitializing default profile",
+                backup,
+                exc,
+            )
+        except OSError as copy_exc:
+            logger.error("Corrupt profiles.json (%s) and backup failed (%s)", exc, copy_exc)
+
     def _load_or_init(self) -> None:
         loaded: list[UserProfile] = []
         if self._profiles_path.exists():
             try:
                 raw = json.loads(self._profiles_path.read_text(encoding="utf-8"))
-                if isinstance(raw, list):
-                    for item in raw:
-                        loaded.append(UserProfile.model_validate(item))
-            except (OSError, json.JSONDecodeError, ValueError):
+                if not isinstance(raw, list):
+                    raise ValueError("profiles.json root must be a JSON list")
+                for item in raw:
+                    loaded.append(UserProfile.model_validate(item))
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                self._backup_corrupt_profiles(exc)
                 loaded = []
 
         if not any(p.id == "default" for p in loaded):
             loaded.insert(0, self._default_profile())
 
+        # Always build default profile first so lazy OAuth inheritance resolves cleanly
+        loaded.sort(key=lambda p: (0 if p.id == "default" else 1))
+
         for profile in loaded:
+            try:
+                ctx = self._build_context(profile)
+            except Exception as exc:
+                if profile.id == "default":
+                    raise
+                logger.error(
+                    "Skipping profile '%s' because its database/config failed to initialize: %s",
+                    profile.id,
+                    exc,
+                )
+                continue
             self._profiles[profile.id] = profile
-            self._contexts[profile.id] = self._build_context(profile)
+            self._contexts[profile.id] = ctx
 
         self._save_profiles()
 
     def _save_profiles(self) -> None:
         payload = [p.model_dump(mode="json") for p in self._profiles.values()]
         tmp = self._profiles_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, indent=2))
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
         os.replace(tmp, self._profiles_path)
+
+    def _default_settings_provider(self) -> Settings:
+        default_ctx = self._contexts.get("default")
+        if default_ctx is not None:
+            return default_ctx.config_manager.settings
+        return self.base_settings
 
     def _build_context(self, profile: UserProfile) -> ProfileContext:
         if profile.is_default or profile.id == "default":
             cfg_mgr = ConfigManager(base_settings=self.base_settings)
         else:
-            # Inherit shared Google OAuth client credentials from default profile if configured
-            default_ctx = self._contexts.get("default")
             base_dump = self.base_settings.model_dump()
-            if default_ctx is not None:
-                default_s = default_ctx.config_manager.settings
-                if default_s.google_client_id:
-                    base_dump["google_client_id"] = default_s.google_client_id
-                if default_s.google_client_secret:
-                    base_dump["google_client_secret"] = default_s.google_client_secret
-                if default_s.synology_url:
-                    base_dump["synology_url"] = default_s.synology_url
-
+            # Clear inherited fields in base_dump so ConfigManager resolves them lazily from default
+            base_dump["google_client_id"] = ""
+            base_dump["google_client_secret"] = ""
             base_dump["data_dir"] = self.base_settings.data_dir / "profiles" / profile.id
             base_dump["work_dir"] = self.base_settings.work_dir / "profiles" / profile.id
             base_dump["inbox_dir"] = self.base_settings.inbox_dir / profile.id
@@ -145,7 +200,10 @@ class ProfileRegistry:
                 base_dump["synology_username"] = profile.dsm_username
 
             profile_settings = Settings.model_validate(base_dump)
-            cfg_mgr = ConfigManager(base_settings=profile_settings)
+            cfg_mgr = ConfigManager(
+                base_settings=profile_settings,
+                fallback_settings_provider=self._default_settings_provider,
+            )
 
         db = StateDB(cfg_mgr.settings.db_path)
         pipeline = MigrationPipeline(config_manager=cfg_mgr, db=db)
@@ -164,10 +222,13 @@ class ProfileRegistry:
                 raise KeyError(f"Profile '{key}' does not exist")
             return ctx
 
-    def list_profiles(self) -> list[dict[str, Any]]:
+    def list_profiles(self, *, dsm_user_filter: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
+            target_user = dsm_user_filter.strip().lower() if dsm_user_filter else None
             result: list[dict[str, Any]] = []
             for ctx in self._contexts.values():
+                if target_user is not None and ctx.profile.dsm_username.lower() != target_user:
+                    continue
                 data = ctx.profile.model_dump(mode="json")
                 data["inbox_dir"] = str(ctx.config_manager.settings.inbox_dir)
                 data["stats"] = ctx.db.get_stats()
@@ -179,7 +240,7 @@ class ProfileRegistry:
         with self._lock:
             return [ctx for ctx in self._contexts.values() if ctx.profile.enabled]
 
-    def discover_synology_users(self) -> dict[str, Any]:
+    def discover_synology_users(self, *, only_username: str | None = None) -> dict[str, Any]:
         """Inspect mounted /data/homes (/volume1/homes) to list available Synology DSM users."""
         homes = self.base_settings.homes_dir
         if not homes.is_dir():
@@ -188,12 +249,15 @@ class ProfileRegistry:
         existing_usernames = {
             p.dsm_username.lower() for p in self._profiles.values() if p.dsm_username
         }
+        filter_lower = only_username.strip().lower() if only_username else None
         users: list[dict[str, Any]] = []
         try:
             for entry in sorted(homes.iterdir(), key=lambda p: p.name.lower()):
                 if not entry.is_dir():
                     continue
                 if entry.name.startswith(".") or entry.name in IGNORED_HOME_DIRS:
+                    continue
+                if filter_lower is not None and entry.name.lower() != filter_lower:
                     continue
                 photos_path = entry / "Photos"
                 users.append(
@@ -224,34 +288,38 @@ class ProfileRegistry:
         """Create a new Synology user or Shared Space migration profile."""
         with self._lock:
             username = req.dsm_username.strip()
-            custom_sub = req.custom_subfolder.strip().strip("/")
+            custom_sub = req.custom_subfolder.strip().rstrip("/")
 
             if req.target_space == "personal":
                 if not username:
                     raise ValueError("Synology DSM username is required for Personal Space profiles.")
                 if "/" in username or "\\" in username or ".." in username:
                     raise ValueError("Invalid Synology username.")
-                photos_path = self.base_settings.homes_dir / username / "Photos"
-                if custom_sub:
-                    photos_path = photos_path / custom_sub
+                user_base = _resolve_contained_subfolder(self.base_settings.homes_dir, username)
+                photos_base = user_base / "Photos"
+                photos_path = _resolve_contained_subfolder(photos_base, custom_sub)
                 base_slug = _slugify(username if not custom_sub else f"{username}-{custom_sub}")
                 default_display = f"{username} (Personal Space)"
             else:
-                photos_path = self.base_settings.photos_dir
-                if custom_sub:
-                    if ".." in Path(custom_sub).parts:
-                        raise ValueError("Invalid subfolder path.")
-                    photos_path = photos_path / custom_sub
+                photos_path = _resolve_contained_subfolder(self.base_settings.photos_dir, custom_sub)
                 base_slug = _slugify(req.display_name or custom_sub or "shared")
                 default_display = req.display_name.strip() or (
                     f"Shared / {custom_sub}" if custom_sub else "Shared Space"
                 )
 
+            # Reject duplicate target photos_dir across profiles so two DBs never contend on one folder
+            resolved_new = photos_path.resolve()
+            for existing in self._profiles.values():
+                if Path(existing.photos_dir).resolve() == resolved_new:
+                    raise ValueError(
+                        f"Photos directory '{resolved_new}' is already managed by profile '{existing.id}'."
+                    )
+
             profile_id = base_slug
-            if profile_id == "default":
+            if profile_id in RESERVED_PROFILE_IDS:
                 profile_id = f"{base_slug}-2"
             counter = 2
-            while profile_id in self._profiles:
+            while profile_id in self._profiles or profile_id in RESERVED_PROFILE_IDS:
                 profile_id = f"{base_slug}-{counter}"
                 counter += 1
 
@@ -284,11 +352,28 @@ class ProfileRegistry:
             return ctx.profile.model_dump(mode="json")
 
     def delete_profile(self, profile_id: str) -> None:
+        """Remove a non-default profile and clean up its isolated DB, token, work, and inbox dirs."""
         with self._lock:
             if profile_id == "default":
                 raise ValueError("The default profile cannot be deleted.")
             if profile_id not in self._profiles:
                 raise KeyError(f"Profile '{profile_id}' does not exist")
+            ctx = self._contexts.pop(profile_id, None)
             self._profiles.pop(profile_id, None)
-            self._contexts.pop(profile_id, None)
             self._save_profiles()
+
+            if ctx is not None:
+                settings = ctx.config_manager.settings
+                for path in (
+                    settings.token_path,
+                    settings.data_dir,
+                    settings.work_dir,
+                    settings.inbox_dir,
+                ):
+                    try:
+                        if path.is_file():
+                            path.unlink(missing_ok=True)
+                        elif path.is_dir():
+                            shutil.rmtree(path, ignore_errors=True)
+                    except OSError as exc:
+                        logger.warning("Cleanup failed for deleted profile '%s' path %s: %s", profile_id, path, exc)

@@ -56,19 +56,24 @@
   }
 
   function escapeHtml(text) {
-    const div = document.createElement("div");
-    div.textContent = text ?? "";
-    return div.innerHTML;
+    return String(text ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   async function apiFetch(url, options = {}) {
+    const { headers: customHeaders, ...restOptions } = options;
     const resp = await fetch(urlFor(url), {
+      ...restOptions,
       headers: {
         "Content-Type": "application/json",
         "X-Profile-Id": activeProfileId,
-        ...(options.headers || {}),
+        "X-Requested-With": "XMLHttpRequest",
+        ...(customHeaders || {}),
       },
-      ...options,
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {

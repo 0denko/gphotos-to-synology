@@ -1,8 +1,9 @@
-"""Watched local/NAS inbox scanner with file-size stability checks."""
+"""Watched local/NAS inbox scanner with symlink rejection and (size, mtime) stability checks."""
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import shutil
 import time
@@ -11,6 +12,8 @@ from pathlib import Path
 
 from gphotos_synology.config import Settings
 from gphotos_synology.takeout.extractor import extract_batch_key, is_supported_archive
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -29,14 +32,14 @@ class LocalInboxScanner:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._seen_sizes: dict[str, tuple[int, float]] = {}
+        self._seen_stats: dict[str, tuple[int, int, float]] = {}
 
     def _fingerprint(self, path: Path, size: int, mtime_ns: int) -> str:
         raw = f"{path.name}:{size}:{mtime_ns}".encode()
         return hashlib.sha256(raw).hexdigest()[:24]
 
     def scan_ready_archives(self) -> list[InboxArchiveItem]:
-        """Return archives in INBOX_DIR whose size has been stable for `inbox_stability_seconds`."""
+        """Return archives in INBOX_DIR whose (size, mtime) have been stable for `inbox_stability_seconds`."""
         inbox = self.settings.inbox_dir
         inbox.mkdir(parents=True, exist_ok=True)
 
@@ -45,6 +48,9 @@ class LocalInboxScanner:
         active_keys: set[str] = set()
 
         for entry in sorted(inbox.iterdir(), key=lambda p: p.name.lower()):
+            if entry.is_symlink():
+                logger.warning("Skipping symlink in inbox: %s", entry.name)
+                continue
             if not entry.is_file():
                 continue
             if entry.name.startswith(".") or entry.name.endswith(".part"):
@@ -57,15 +63,18 @@ class LocalInboxScanner:
             except OSError:
                 continue
 
+            if stat.st_size <= 0:
+                continue
+
             key = str(entry.resolve())
             active_keys.add(key)
 
             if self.settings.inbox_stability_seconds > 0:
-                prev = self._seen_sizes.get(key)
-                if prev is None or prev[0] != stat.st_size:
-                    self._seen_sizes[key] = (stat.st_size, now)
+                prev = self._seen_stats.get(key)
+                if prev is None or prev[0] != stat.st_size or prev[1] != stat.st_mtime_ns:
+                    self._seen_stats[key] = (stat.st_size, stat.st_mtime_ns, now)
                     continue
-                if (now - prev[1]) < self.settings.inbox_stability_seconds:
+                if (now - prev[2]) < self.settings.inbox_stability_seconds:
                     continue
 
             ready.append(
@@ -79,14 +88,17 @@ class LocalInboxScanner:
             )
 
         # Clean up tracking entries for files no longer in inbox
-        for stale in list(self._seen_sizes.keys()):
+        for stale in list(self._seen_stats.keys()):
             if stale not in active_keys:
-                self._seen_sizes.pop(stale, None)
+                self._seen_stats.pop(stale, None)
 
         return ready
 
     def finalize_archive(self, archive_path: Path) -> None:
         """Apply configured post-processing action after successful archive ingestion."""
+        if archive_path.is_symlink():
+            logger.warning("Refusing to finalize symlink archive: %s", archive_path)
+            return
         action = self.settings.inbox_post_action
         if action == "keep":
             return

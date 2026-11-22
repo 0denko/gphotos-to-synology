@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build a self-contained native Synology DSM 7 .spk package.
+"""Build a deterministic, self-contained native Synology DSM 7 .spk package.
 
 When built with `--bundle-dir <pyinstaller_onedir>`, the resulting .spk includes
-the entire Python 3.12 + FastAPI + Pillow + Google Drive runtime as a standalone
+the entire Python 3.12 + FastAPI + Pillow/HEIF + Google Drive runtime as a standalone
 native daemon managed directly by Synology DSM Package Center — ZERO Docker,
 ZERO Container Manager, ZERO YAML, ZERO SSH.
 """
@@ -10,13 +10,13 @@ ZERO Container Manager, ZERO YAML, ZERO SSH.
 from __future__ import annotations
 
 import argparse
+import gzip
 import io
 import json
 import os
 import shutil
 import stat
 import tarfile
-from datetime import UTC, datetime
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -24,8 +24,9 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
 DIST_DIR = PROJECT_ROOT / "dist"
-VERSION = "1.1.0-0003"
+VERSION = "1.2.0-0001"
 PKG_NAME = "gphotos-migrator"
+DEFAULT_DETERMINISTIC_MTIME = 1700000000
 
 DSM_ARCH_MAP: dict[str, str] = {
     "noarch": "noarch",
@@ -91,11 +92,75 @@ def _write_exec(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
+def _preupgrade_script() -> str:
+    return f"""#!/bin/sh
+# G8: Snapshot config & SQLite DB before upgrade (keep latest 3 snapshots).
+PKG="{PKG_NAME}"
+PKG_VAR="${{SYNOPKG_PKGVAR:-/var/packages/${{PKG}}/var}}"
+if [ -d "${{PKG_VAR}}/config" ]; then
+    TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo backup)"
+    SNAP_ROOT="${{PKG_VAR}}/backups"
+    SNAP_DIR="${{SNAP_ROOT}}/upgrade-${{TS}}"
+    mkdir -p "${{SNAP_DIR}}" 2>/dev/null || true
+    cp -a "${{PKG_VAR}}/config" "${{SNAP_DIR}}/config" 2>/dev/null || true
+    # Keep only the 3 most recent upgrade snapshots
+    ls -1dt "${{SNAP_ROOT}}"/upgrade-* 2>/dev/null | tail -n +4 | xargs -r rm -rf 2>/dev/null || true
+fi
+exit 0
+"""
+
+
+def _preuninst_script() -> str:
+    return f"""#!/bin/sh
+# G8: Preserve sole-copy user data (DB, quarantined originals, unprocessed inbox) on UNINSTALL.
+PKG="{PKG_NAME}"
+PKG_VAR="${{SYNOPKG_PKGVAR:-/var/packages/${{PKG}}/var}}"
+
+if [ "${{SYNOPKG_PKG_STATUS:-UNINSTALL}}" != "UNINSTALL" ]; then
+    exit 0
+fi
+
+detect_photos_dir() {{
+    for vol in /volume1 /volume2 /volume3 /volume4; do
+        if [ -d "${{vol}}/photo" ] && [ -w "${{vol}}/photo" ]; then
+            echo "${{vol}}/photo"
+            return 0
+        fi
+    done
+    echo ""
+}}
+
+PHOTOS_BASE="${{PHOTOS_DIR:-$(detect_photos_dir)}}"
+if [ -n "${{PHOTOS_BASE}}" ]; then
+    TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo uninstall)"
+    BACKUP_DIR="${{PHOTOS_BASE}}/.gphotos-migrator-backup/${{TS}}"
+    mkdir -p "${{BACKUP_DIR}}" 2>/dev/null || true
+    if [ -d "${{PKG_VAR}}/config" ]; then
+        cp -a "${{PKG_VAR}}/config" "${{BACKUP_DIR}}/config" 2>/dev/null || true
+        rm -f "${{BACKUP_DIR}}/config/proxy.secret" 2>/dev/null || true
+    fi
+    if [ -d "${{PKG_VAR}}/work/replaced_duplicates" ]; then
+        cp -a "${{PKG_VAR}}/work/replaced_duplicates" "${{BACKUP_DIR}}/replaced_duplicates" 2>/dev/null || true
+    fi
+    if [ -d "${{PKG_VAR}}/inbox" ]; then
+        cp -a "${{PKG_VAR}}/inbox" "${{BACKUP_DIR}}/inbox" 2>/dev/null || true
+    fi
+fi
+exit 0
+"""
+
+
 def _start_stop_script(*, standalone: bool, build_sha: str, build_date: str) -> str:
     if not standalone:
         return """#!/bin/sh
 case "$1" in
-    start|stop|status|log) exit 0 ;;
+    start|stop|log) exit 0 ;;
+    status)
+        if command -v curl >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8765/api/health >/dev/null 2>&1; then
+            exit 0
+        fi
+        exit 3
+        ;;
     *) exit 0 ;;
 esac
 """
@@ -108,6 +173,8 @@ PKG_VAR="${{SYNOPKG_PKGVAR:-/var/packages/${{PKG}}/var}}"
 BIN="${{PKG_DIR}}/app/gphotos-migrator"
 PID_FILE="${{PKG_VAR}}/gphotos-migrator.pid"
 LOG_FILE="${{PKG_VAR}}/gphotos-migrator.log"
+SECRET_FILE="${{PKG_VAR}}/proxy.secret"
+LOCK_DIR="${{PKG_VAR}}/start.lock"
 
 detect_dir() {{
     folder="$1"
@@ -120,10 +187,43 @@ detect_dir() {{
     echo "/volume1/${{folder}}"
 }}
 
+ensure_proxy_secret() {{
+    if [ ! -s "${{SECRET_FILE}}" ]; then
+        (
+            umask 077
+            if command -v python3 >/dev/null 2>&1; then
+                python3 -c "import secrets; print(secrets.token_hex(32))" > "${{SECRET_FILE}}.tmp"
+            elif [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
+                od -An -tx1 -N32 /dev/urandom | tr -d ' \\n' > "${{SECRET_FILE}}.tmp"
+            else
+                date +%s%N > "${{SECRET_FILE}}.tmp"
+            fi
+            chmod 600 "${{SECRET_FILE}}.tmp" 2>/dev/null || true
+            mv -f "${{SECRET_FILE}}.tmp" "${{SECRET_FILE}}"
+        )
+    fi
+    chmod 600 "${{SECRET_FILE}}" 2>/dev/null || true
+}}
+
+rotate_log() {{
+    if [ -f "${{LOG_FILE}}" ]; then
+        size="$(wc -c < "${{LOG_FILE}}" 2>/dev/null || echo 0)"
+        if [ "${{size}}" -gt 10485760 ] 2>/dev/null; then
+            mv -f "${{LOG_FILE}}" "${{LOG_FILE}}.1" 2>/dev/null || true
+        fi
+    fi
+}}
+
 is_running() {{
     if [ -f "${{PID_FILE}}" ]; then
         pid="$(cat "${{PID_FILE}}" 2>/dev/null)"
         if [ -n "${{pid}}" ] && kill -0 "${{pid}}" 2>/dev/null; then
+            if [ -r "/proc/${{pid}}/cmdline" ]; then
+                if tr '\\0' ' ' < "/proc/${{pid}}/cmdline" 2>/dev/null | grep -q "gphotos-migrator"; then
+                    return 0
+                fi
+                return 1
+            fi
             return 0
         fi
     fi
@@ -131,10 +231,22 @@ is_running() {{
 }}
 
 start_daemon() {{
+    if ! mkdir "${{LOCK_DIR}}" 2>/dev/null; then
+        sleep 1
+        if is_running; then
+            return 0
+        fi
+        rmdir "${{LOCK_DIR}}" 2>/dev/null || true
+        mkdir "${{LOCK_DIR}}" 2>/dev/null || return 1
+    fi
+    trap 'rmdir "${{LOCK_DIR}}" 2>/dev/null || true' EXIT
+
     if is_running; then
         return 0
     fi
     mkdir -p "${{PKG_VAR}}/config" "${{PKG_VAR}}/work" "${{PKG_VAR}}/inbox" 2>/dev/null || true
+    ensure_proxy_secret
+    rotate_log
 
     export HOME="${{PKG_VAR}}"
     export TMPDIR="${{PKG_VAR}}/work"
@@ -143,6 +255,7 @@ start_daemon() {{
     export INBOX_DIR="${{PKG_VAR}}/inbox"
     export PHOTOS_DIR="$(detect_dir photo)"
     export HOMES_DIR="$(detect_dir homes)"
+    export PROXY_SECRET_FILE="${{SECRET_FILE}}"
     export APP_HOST="127.0.0.1"
     export APP_PORT="8765"
     export APP_BUILD_SHA="{build_sha}"
@@ -151,7 +264,6 @@ start_daemon() {{
     nohup "${{BIN}}" >> "${{LOG_FILE}}" 2>&1 &
     echo $! > "${{PID_FILE}}"
 
-    # Wait briefly for process to stay alive
     sleep 1
     if is_running; then
         return 0
@@ -167,12 +279,14 @@ stop_daemon() {{
     pid="$(cat "${{PID_FILE}}")"
     kill "${{pid}}" 2>/dev/null || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        if ! kill -0 "${{pid}}" 2>/dev/null; then
+        if ! is_running; then
             break
         fi
         sleep 1
     done
-    kill -9 "${{pid}}" 2>/dev/null || true
+    if is_running; then
+        kill -9 "${{pid}}" 2>/dev/null || true
+    fi
     rm -f "${{PID_FILE}}"
     return 0
 }}
@@ -214,7 +328,8 @@ def build_spk(
 
     standalone = bundle_dir is not None
     sha = build_sha or os.environ.get("APP_BUILD_SHA", "dev")
-    bdate = build_date or os.environ.get("APP_BUILD_DATE") or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    bdate = build_date or os.environ.get("APP_BUILD_DATE", "")
+    det_mtime = int(os.environ.get("SOURCE_DATE_EPOCH", str(DEFAULT_DETERMINISTIC_MTIME)))
 
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     suffix = "" if arch_key == "noarch" else f"-{arch_key}"
@@ -253,6 +368,7 @@ def build_spk(
         ti.gid = 0
         ti.uname = "root"
         ti.gname = "root"
+        ti.mtime = det_mtime
         if ti.isfile() and (ti.mode & stat.S_IXUSR):
             ti.mode = 0o755
         elif ti.isfile():
@@ -261,9 +377,13 @@ def build_spk(
             ti.mode = 0o755
         return ti
 
-    # Build package.tgz (extracts to /var/packages/gphotos-migrator/target)
+    # Build deterministic package.tgz (extracts to /var/packages/gphotos-migrator/target)
     pkg_tgz = stage / "package.tgz"
-    with tarfile.open(pkg_tgz, "w:gz") as tf:
+    with (
+        open(pkg_tgz, "wb") as raw_gz,
+        gzip.GzipFile(filename="", mode="wb", fileobj=raw_gz, mtime=0) as gz,
+        tarfile.open(fileobj=gz, mode="w") as tf,
+    ):
         for item in sorted(payload.rglob("*")):
             rel = item.relative_to(payload)
             tf.add(item, arcname=str(rel), recursive=False, filter=_normalize_tarinfo)
@@ -273,7 +393,7 @@ def build_spk(
 
     desc = (
         "All-in-one native Synology DSM 7 app for unattended Google Photos to Synology Photos migration "
-        "(zero Docker or YAML required). Includes multi-user picker, EXIF repair, visual deduplication, "
+        "(zero Docker or YAML required). Includes multi-user picker, EXIF repair, HEIC visual deduplication, "
         "and automatic clarity/resolution upgrade."
         if standalone
         else "Native Synology DSM desktop window for Google Photos Migrator."
@@ -315,9 +435,10 @@ def build_spk(
 
     scripts_dir = stage / "scripts"
     noop_script = "#!/bin/sh\nexit 0\n"
-    for name in ("preinst", "postinst", "preuninst", "postuninst", "preupgrade", "postupgrade"):
+    for name in ("preinst", "postinst", "postuninst", "postupgrade"):
         _write_exec(scripts_dir / name, noop_script)
-
+    _write_exec(scripts_dir / "preupgrade", _preupgrade_script())
+    _write_exec(scripts_dir / "preuninst", _preuninst_script())
     _write_exec(
         scripts_dir / "start-stop-status",
         _start_stop_script(standalone=standalone, build_sha=sha, build_date=bdate),
