@@ -70,6 +70,12 @@ class _MockDSMWebAPI:
                     payload = {"success": True, "data": {"timeout": 15}}
                 elif parent.mode == "initdata_only" and api == "SYNO.Core.Desktop.Initdata":
                     payload = {"success": True, "data": {"Session": {"SynoToken": "tok"}}}
+                elif parent.mode == "dsm73_loopback_119":
+                    if api == "SYNO.Core.Desktop.Initdata":
+                        payload = {"success": True, "data": {"Session": {"SynoToken": "tok"}}}
+                    else:
+                        # Real DSM 7.3.2 behavior: NormalUser & Timeout return 119 from loopback
+                        payload = {"success": False, "error": {"code": 119}}
                 else:
                     # Simulate API not present -> triggers fallback probe
                     payload = {"success": False, "error": {"code": 102}}
@@ -472,3 +478,79 @@ def test_dsm73_oauth_callback_via_bridge_and_fresh_webapi(
             cookie="id=invalid-session",
         )
         assert st == 403
+
+
+def test_dsm73_probe_chain_falls_through_on_119_and_short_circuits_on_normal_user(
+    tmp_path: Path,
+) -> None:
+    """Regression for 1.2.0-0002 live bug: NormalUser/Timeout returning 119 from loopback
+    must fall through to Initdata; all-probes-119 still returns 403; NormalUser returning
+    username short-circuits on probe 1 without needing desktop dsm_user."""
+    secret = "dsm73-119-secret"
+    bridge_dir = tmp_path / "sessions"
+    settings = Settings(
+        data_dir=tmp_path / "config",
+        work_dir=tmp_path / "work",
+        inbox_dir=tmp_path / "inbox",
+        photos_dir=tmp_path / "photos",
+        proxy_secret=secret,
+        min_free_disk_gb=0.1,
+    )
+    app = create_app(base_settings=settings, start_worker=False)
+    valid_cookie = "_SSID=real-browser-ssid; id=real-browser-id; did=dev1; stay_login=1"
+
+    with _LiveBackend(app) as backend:
+        # 1. DSM 7.3 loopback behavior: NormalUser -> 119, Timeout -> 119, Initdata -> success
+        with _MockDSMWebAPI(mode="dsm73_loopback_119", valid_cookies={"id=real-browser-id"}) as webapi:
+            st, hdrs, body = _exec_cgi(
+                PROXY_CGI,
+                backend_url=backend.url,
+                dsm_webapi_url=webapi.url,
+                bridge_dir=bridge_dir,
+                proxy_secret=secret,
+                query_string="dsm_user=oleksandr",
+                cookie=valid_cookie,
+            )
+            assert st == 200
+            assert b"Google Photos" in body
+            assert [c["api"] for c in webapi.calls] == [
+                "SYNO.Core.NormalUser",
+                "SYNO.Core.Desktop.Timeout",
+                "SYNO.Core.Desktop.Initdata",
+            ]
+            _extract_bridge_cookie(hdrs["set-cookie"])
+
+            # Invalid session fails all three probes (including Initdata -> 119) -> 403
+            webapi.calls.clear()
+            st_bad, _hdrs_bad, _body_bad = _exec_cgi(
+                PROXY_CGI,
+                backend_url=backend.url,
+                dsm_webapi_url=webapi.url,
+                bridge_dir=bridge_dir,
+                proxy_secret=secret,
+                query_string="dsm_user=oleksandr",
+                cookie="id=expired-or-forged",
+            )
+            assert st_bad == 403
+            assert [c["api"] for c in webapi.calls] == [
+                "SYNO.Core.NormalUser",
+                "SYNO.Core.Desktop.Timeout",
+                "SYNO.Core.Desktop.Initdata",
+            ]
+
+        # 2. When NormalUser succeeds and returns data.username, probe 1 short-circuits
+        with _MockDSMWebAPI(mode="normal_user", valid_cookies={"id=real-browser-id"}) as webapi:
+            st_nu, hdrs_nu, body_nu = _exec_cgi(
+                PROXY_CGI,
+                backend_url=backend.url,
+                dsm_webapi_url=webapi.url,
+                bridge_dir=bridge_dir,
+                proxy_secret=secret,
+                query_string="",  # No desktop dsm_user needed when NormalUser supplies username
+                cookie=valid_cookie,
+            )
+            assert st_nu == 200
+            assert b"Google Photos" in body_nu
+            assert [c["api"] for c in webapi.calls] == ["SYNO.Core.NormalUser"]
+            _extract_bridge_cookie(hdrs_nu["set-cookie"])
+

@@ -34,9 +34,6 @@ BRIDGE_COOKIE_NAME = "gphotos_dsm_bridge"
 DEFAULT_BRIDGE_TTL_SECONDS = 1800
 DSM_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
 
-# DSM WebAPI error codes meaning the API/method/version is absent (safe to try fallback API)
-_API_UNAVAILABLE_CODES = frozenset({102, 103, 104})
-
 # Lightweight auth-required DSM APIs tried in order before falling back to Initdata:
 # 1. SYNO.Core.NormalUser (v1, get): ~200 B, returns authenticated user's own username when available
 # 2. SYNO.Core.Desktop.Timeout (v1, get): ~100 B, proves valid DSM session without SynoToken
@@ -261,13 +258,10 @@ def validate_dsm_session_via_webapi(cookie_header):
                         break
             return True, server_user
 
-        err = payload.get("error") if isinstance(payload, dict) else None
-        err_code = err.get("code") if isinstance(err, dict) else None
-        if err_code in _API_UNAVAILABLE_CODES:
-            # Try next lightweight probe / Initdata fallback
-            continue
-        # Session invalid/expired (e.g. 119, 105, 106) -> fail closed immediately
-        return False, None
+        # Any DSM error from a non-final probe (including 119 on NormalUser/Timeout due to
+        # loopback source-IP binding) falls through to the next probe; only failing ALL probes
+        # (including Initdata) fails closed.
+        continue
 
     return False, None
 
