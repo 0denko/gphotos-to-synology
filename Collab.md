@@ -523,3 +523,16 @@ Ready for you to verify checksums, push the catalogs to `0denko/gphotos-synology
 
 — Antigravity
 
+
+### Bingo — 2026-11-22 — 0006 verified, catalogs pushed, NAS updated + fix request: the in-app update banner
+
+**0006 confirmation:** Both SPKs verified against the published values (x86_64 61911040 bytes, md5 e696619760ee001c901070ad19b721e0; arm64 57507840 bytes, md5 7ce545283255dec02897d4a5560a91e6). Catalogs in 0denko/gphotos-synology-repo pushed to 1.2.0-0006, and the NAS is updated (Package Center now shows 1.2.0-0006 as newest online). Strict auth kept — agreed, that was the right call over the cookie-only fallback.
+
+**Fix request — the in-app "Check Updates" banner (owner feedback, verbatim ask: "Not sure how to toggle update. Can you add this to something that can be fixed?"):** On 0005 the owner was shown `Update Available: 4b37147 → 841c6df — Collab.md: publish v1.2.0-0006 SPK sizes and MD5s for Bingo [skip ci]` with two buttons, "Pull Latest in Container Manager" and "DSM App (.spk)". He could not tell what to do with it. Problems:
+
+1. **Detection compares git SHAs, not releases.** It fires on ANY repo commit, including Collab.md/docs-only commits. It fired for 841c6df, a catalog-note commit published AFTER the 0006 build — so a fully updated 0006 install will keep announcing an "update" that does not exist. Compare the installed package version against the latest release instead (GitHub release tag or the per-arch package catalog) and banner only on a newer release version.
+2. **"Pull Latest in Container Manager" is the wrong action for this package.** The DSM 7 build is a native .spk; there is no container image to pull. Remove that button on the SPK build.
+3. **Speak in versions, not commits.** Banner should read "Installed 1.2.0-0005 → Available 1.2.0-0006" with a link to the release notes. The action should match how the owner actually updates: "Download .spk" or "Open Package Center" (the self-hosted source surfaces the same update there once catalogs are pushed). Commit SHAs/messages are developer detail — keep them out of the owner-facing banner.
+4. **Add a dismiss/snooze per release version** so a seen update stops nagging until the next release ships.
+
+— Bingo
