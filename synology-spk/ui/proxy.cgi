@@ -1,120 +1,26 @@
 #!/usr/bin/python3
-"""Same-origin DSM 7 CGI reverse proxy for Google Photos Migrator.
+"""Same-origin DSM 7.3+ CGI reverse proxy for Google Photos Migrator.
 
 Synology DSM 7 nginx routes `/webman/3rdparty/.../*.cgi` (matching `\\.cgi$`
 without PATH_INFO). Subpaths are passed via the `p` query parameter:
     https://<nas>:5001/webman/3rdparty/gphotos-migrator/proxy.cgi?p=/api/status
 and forwarded to the local daemon at:
     http://127.0.0.1:8765/api/status
-with server-side DSM authentication, X-Proxy-Secret, X-DSM-User, X-DSM-Admin,
-and X-Requested-With CSRF header forwarding.
+using shared webapi session validation + session bridge (`dsm_auth.py`),
+`X-Proxy-Secret`, `X-DSM-User`, `X-DSM-Admin`, and `X-Requested-With`.
 """
 
-import grp
 import json
 import os
-import re
-import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
-BACKEND_BASE = os.environ.get("GPHOTOS_BACKEND_URL", "http://127.0.0.1:8765").rstrip("/")
-UI_PREFIX = "/webman/3rdparty/gphotos-migrator"
-AUTH_CGI = "/usr/syno/synoman/webman/authenticate.cgi"
-DEFAULT_SECRET_FILE = "/var/packages/gphotos-migrator/var/proxy.secret"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import dsm_auth  # noqa: E402
+
 MAX_REQUEST_BODY_BYTES = 1024 * 1024  # 1 MiB cap for JSON API payloads
-DSM_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
-
-HOP_BY_HOP_HEADERS = {
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-    "content-length",
-}
-
-
-def get_proxy_secret():
-    env_secret = os.environ.get("GPHOTOS_PROXY_SECRET", "").strip()
-    if env_secret:
-        return env_secret
-    secret_file = os.environ.get("GPHOTOS_PROXY_SECRET_FILE", DEFAULT_SECRET_FILE)
-    try:
-        if os.path.isfile(secret_file):
-            with open(secret_file, "r", encoding="utf-8") as fh:
-                return fh.read().strip()
-    except OSError:
-        pass
-    return ""
-
-
-def get_dsm_user():
-    """Verify an active Synology DSM web session and return a validated DSM username."""
-    if not os.path.isfile(AUTH_CGI):
-        if os.environ.get("GPHOTOS_SKIP_DSM_AUTH") == "1":
-            user = os.environ.get("GPHOTOS_TEST_DSM_USER", "admin").strip()
-            return user if DSM_USER_RE.match(user) else None
-        return None
-    try:
-        proc = subprocess.run(
-            [AUTH_CGI],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
-        if not lines:
-            return None
-        user = lines[-1]
-        return user if DSM_USER_RE.match(user) else None
-    except Exception:
-        return None
-
-
-def is_dsm_admin(username):
-    """Determine if the authenticated DSM user belongs to the Synology administrators group."""
-    if not os.path.isfile(AUTH_CGI) and os.environ.get("GPHOTOS_SKIP_DSM_AUTH") == "1":
-        return os.environ.get("GPHOTOS_TEST_DSM_ADMIN", "1").strip() == "1"
-    if not username:
-        return False
-    try:
-        admin_grp = grp.getgrnam("administrators")
-        if username in admin_grp.gr_mem:
-            return True
-    except KeyError:
-        pass
-    return username == "admin"
-
-
-def _sanitize_header_part(value):
-    s = str(value)
-    if "\r" in s or "\n" in s or "\x00" in s:
-        return None
-    return s
-
-
-def write_response(status, headers, body):
-    out = sys.stdout.buffer
-    out.write(("Status: %d\r\n" % int(status)).encode("ascii"))
-    for k, v in headers:
-        if k.lower() in HOP_BY_HOP_HEADERS:
-            continue
-        sk = _sanitize_header_part(k)
-        sv = _sanitize_header_part(v)
-        if sk is None or sv is None:
-            continue
-        out.write(("%s: %s\r\n" % (sk, sv)).encode("latin-1", errors="ignore"))
-    out.write(("Content-Length: %d\r\n" % len(body)).encode("ascii"))
-    out.write(b"\r\n")
-    out.write(body)
-    out.flush()
 
 
 def render_backend_offline_html():
@@ -145,16 +51,45 @@ def render_backend_offline_html():
     return html.encode("utf-8")
 
 
+def render_auth_error_html(title, detail):
+    html = (
+        """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>%s</title>
+<style>
+  body{margin:0;background:#0b1120;color:#e5ecf6;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:40px 24px;line-height:1.55}
+  .box{max-width:560px;margin:40px auto;background:#111827;border:1px solid #243047;border-radius:12px;padding:28px;text-align:center}
+  h1{margin:0 0 10px;font-size:1.25rem;color:#f87171}
+  p{color:#94a3b8;margin:0 0 16px}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>%s</h1>
+  <p>%s</p>
+</div>
+</body>
+</html>"""
+        % (title, title, detail)
+    )
+    return html.encode("utf-8")
+
+
 def _extract_target_path_and_query():
     raw_qs = os.environ.get("QUERY_STRING", "")
     path_info = os.environ.get("PATH_INFO", "")
 
     pairs = urllib.parse.parse_qsl(raw_qs, keep_blank_values=True)
     target_path = None
+    desktop_dsm_user = ""
     forwarded_pairs = []
     for k, v in pairs:
         if k == "p" and target_path is None:
             target_path = v
+        elif k == "dsm_user" and not desktop_dsm_user:
+            desktop_dsm_user = v
         else:
             forwarded_pairs.append((k, v))
 
@@ -168,22 +103,63 @@ def _extract_target_path_and_query():
         target_path = "/" + target_path
 
     forwarded_qs = urllib.parse.urlencode(forwarded_pairs, doseq=True)
-    return target_path, forwarded_qs
+    return target_path, forwarded_qs, desktop_dsm_user
 
 
 def main():
-    dsm_user = get_dsm_user()
+    target_path, forwarded_qs, desktop_dsm_user = _extract_target_path_and_query()
+    method = os.environ.get("REQUEST_METHOD", "GET").upper()
+
+    proto = "https" if os.environ.get("HTTPS", "").lower() in ("on", "1", "true") else "http"
+    if os.environ.get("SERVER_PORT") == "5001":
+        proto = "https"
+    is_https = proto == "https"
+
+    dsm_user, dsm_is_admin, set_cookie, auth_err = dsm_auth.authenticate_proxy_request(
+        desktop_dsm_user, is_https
+    )
     if not dsm_user:
-        write_response(
+        if auth_err == "missing_user":
+            msg = (
+                "Could not determine your Synology DSM username from the desktop session. "
+                "Please close this window, refresh DSM, and open Google Photos Migrator from the DSM Main Menu."
+            )
+            if method == "GET" and target_path == "/":
+                dsm_auth.write_response(
+                    403,
+                    [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+                    render_auth_error_html("DSM User Identity Missing", msg),
+                )
+            else:
+                dsm_auth.write_response(
+                    403,
+                    [("Content-Type", "application/json; charset=utf-8")],
+                    json.dumps({"detail": msg}).encode("utf-8"),
+                )
+            return
+        if auth_err == "not_admin":
+            msg = "Administrator privileges are required to open Google Photos Migrator."
+            if method == "GET" and target_path == "/":
+                dsm_auth.write_response(
+                    403,
+                    [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+                    render_auth_error_html("Administrator Access Required", msg),
+                )
+            else:
+                dsm_auth.write_response(
+                    403,
+                    [("Content-Type", "application/json; charset=utf-8")],
+                    json.dumps({"detail": msg}).encode("utf-8"),
+                )
+            return
+        dsm_auth.write_response(
             403,
             [("Content-Type", "text/plain; charset=utf-8")],
             b"DSM authentication required. Please sign in to Synology DSM.",
         )
         return
 
-    target_path, forwarded_qs = _extract_target_path_and_query()
-    method = os.environ.get("REQUEST_METHOD", "GET").upper()
-    upstream_url = BACKEND_BASE + target_path
+    upstream_url = dsm_auth.BACKEND_BASE + target_path
     if forwarded_qs:
         upstream_url = upstream_url + "?" + forwarded_qs
 
@@ -192,7 +168,7 @@ def main():
     if content_length_raw.isdigit():
         content_len = int(content_length_raw)
         if content_len > MAX_REQUEST_BODY_BYTES:
-            write_response(
+            dsm_auth.write_response(
                 413,
                 [("Content-Type", "application/json; charset=utf-8")],
                 json.dumps({"detail": "Request payload too large (max 1 MiB)"}).encode("utf-8"),
@@ -201,19 +177,16 @@ def main():
         if content_len > 0:
             req_body = sys.stdin.buffer.read(content_len)
 
-    proto = "https" if os.environ.get("HTTPS", "").lower() in ("on", "1", "true") else "http"
-    if os.environ.get("SERVER_PORT") == "5001":
-        proto = "https"
     host = os.environ.get("HTTP_HOST", "")
 
     headers = {
         "X-Forwarded-Proto": proto,
-        "X-Forwarded-Prefix": UI_PREFIX,
+        "X-Forwarded-Prefix": dsm_auth.UI_PREFIX,
         "X-Proxy-Mode": "cgi",
         "X-DSM-User": dsm_user,
-        "X-DSM-Admin": "1" if is_dsm_admin(dsm_user) else "0",
+        "X-DSM-Admin": "1" if dsm_is_admin else "0",
     }
-    proxy_secret = get_proxy_secret()
+    proxy_secret = dsm_auth.get_proxy_secret()
     if proxy_secret:
         headers["X-Proxy-Secret"] = proxy_secret
     raw_forward = [
@@ -226,9 +199,9 @@ def main():
     for hdr_name, hdr_val in raw_forward:
         if not hdr_val:
             continue
-        safe_val = _sanitize_header_part(hdr_val)
+        safe_val = dsm_auth.sanitize_header_part(hdr_val)
         if safe_val is None:
-            write_response(
+            dsm_auth.write_response(
                 400,
                 [("Content-Type", "application/json; charset=utf-8")],
                 json.dumps({"detail": "Invalid control characters in request header"}).encode("utf-8"),
@@ -240,31 +213,34 @@ def main():
         def redirect_request(self, req, fp, code, msg, hdrs, newurl):
             return None
 
-    opener = urllib.request.build_opener(_NoRedirect())
+    # Bypass ambient HTTP_PROXY for loopback backend requests
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     req = urllib.request.Request(upstream_url, data=req_body, headers=headers, method=method)
 
     try:
         with opener.open(req, timeout=60) as resp:
             resp_headers = list(resp.headers.items())
+            if set_cookie:
+                resp_headers.append(("Set-Cookie", set_cookie))
             body = resp.read()
             if target_path == "/" and b"static/styles.css" in body:
                 body = body.replace(b'href="static/styles.css"', b'href="proxy.cgi?p=/static/styles.css"')
                 body = body.replace(b'src="static/app.js"', b'src="proxy.cgi?p=/static/app.js"')
-            write_response(resp.status, resp_headers, body)
+            dsm_auth.write_response(resp.status, resp_headers, body)
     except urllib.error.HTTPError as err:
         resp_headers = list(err.headers.items()) if err.headers else [("Content-Type", "text/plain")]
+        if set_cookie:
+            resp_headers.append(("Set-Cookie", set_cookie))
         body = err.read() if err.fp else b""
-        write_response(err.code, resp_headers, body)
+        dsm_auth.write_response(err.code, resp_headers, body)
     except (urllib.error.URLError, OSError):
         if method == "GET" and target_path == "/":
-            # Return HTTP 200 HTML only for GET / so DSM nginx renders our friendly auto-refreshing startup screen
-            write_response(
-                200,
-                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
-                render_backend_offline_html(),
-            )
+            resp_headers = [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")]
+            if set_cookie:
+                resp_headers.append(("Set-Cookie", set_cookie))
+            dsm_auth.write_response(200, resp_headers, render_backend_offline_html())
         else:
-            write_response(
+            dsm_auth.write_response(
                 503,
                 [("Content-Type", "application/json; charset=utf-8"), ("Cache-Control", "no-store")],
                 json.dumps({"detail": "Google Photos Migrator service is starting or unavailable"}).encode("utf-8"),

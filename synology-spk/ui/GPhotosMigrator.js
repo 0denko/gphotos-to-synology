@@ -22,10 +22,37 @@ Ext.define("SYNO.SDS.GPhotosMigrator.AppWindow", {
 
     PROXY_URL: "/webman/3rdparty/gphotos-migrator/proxy.cgi",
 
+    _resolveDsmUser: function () {
+        try {
+            var sess = (window.SYNO && SYNO.SDS && SYNO.SDS.Session) || null;
+            if (!sess && window.parent && window.parent.SYNO && window.parent.SYNO.SDS) {
+                sess = window.parent.SYNO.SDS.Session;
+            }
+            if (sess) {
+                var candidate = sess.user || sess.account || sess.username || "";
+                if (typeof candidate === "string" && candidate.trim()) {
+                    return candidate.trim();
+                }
+            }
+        } catch (e) {
+            // Fail closed: server will reject missing username if no bridge cookie exists
+        }
+        return "";
+    },
+
+    _buildIframeUrl: function () {
+        var user = this._resolveDsmUser();
+        if (user) {
+            return this.PROXY_URL + "?dsm_user=" + encodeURIComponent(user);
+        }
+        return this.PROXY_URL;
+    },
+
     constructor: function (cfg) {
         cfg = cfg || {};
         var me = this;
         var iframeId = "gphotos-migrator-frame-" + Ext.id();
+        var initialUrl = me._buildIframeUrl();
 
         var framePanel = new Ext.Panel({
             border: false,
@@ -33,7 +60,7 @@ Ext.define("SYNO.SDS.GPhotosMigrator.AppWindow", {
             bodyStyle: "background:#0b1120;overflow:hidden;",
             html:
                 '<iframe id="' + iframeId + '" ' +
-                'src="' + me.PROXY_URL + '" ' +
+                'src="' + initialUrl + '" ' +
                 'style="width:100%;height:100%;border:0;display:block;background:#0b1120;" ' +
                 'allow="clipboard-write"></iframe>'
         });
@@ -55,7 +82,7 @@ Ext.define("SYNO.SDS.GPhotosMigrator.AppWindow", {
                     handler: function () {
                         var el = document.getElementById(iframeId);
                         if (el) {
-                            el.src = me.PROXY_URL;
+                            el.src = me._buildIframeUrl();
                         }
                     }
                 }

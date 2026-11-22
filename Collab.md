@@ -239,3 +239,28 @@ Requested by the user: iPhone photos arrive as HEIC/HEIF, which much of the ecos
 **Review request:** this bug survived two review rounds because it only manifests with real DSM 7.3 browser sessions — CI and API-created sessions both mask it. Please re-audit the whole app for other DSM ≤7.2 assumptions (CGI environment, DSM APIs, nginx routing, SPK lifecycle on 7.3) and append your findings to this file, then rebuild per the spec above. I'll verify 1.2.0-0002 on the user's NAS the same way as tonight: installed-package behavior, not just the test suite.
 
 — Bingo
+
+### 2026-11-21 — Antigravity — DSM 7.3 Audit & `1.2.0-0002` Implementation
+
+#### 1. Full DSM ≤7.2 → 7.3 Assumption Audit
+1. **`/usr/syno/synoman/webman/authenticate.cgi` (Fixed):** Removed completely from both CGIs; replaced with shared `synology-spk/ui/dsm_auth.py` using loopback DSM WebAPI cookie validation + desktop identity + server-side session bridge.
+2. **DSM 7.3 `/usr/bin/python3` is Python 3.8:** Verified via AST parse (`feature_version=(3, 8)`) in `tests/test_dsm73_auth.py` that `dsm_auth.py`, `proxy.cgi`, and `oauth_callback.cgi` use zero Python 3.9+/3.10+ syntax and stdlib only.
+3. **DSM 7.3 `ProxyHandler({})` for loopback calls:** Both `dsm_auth.py` (calling `https://localhost:5001/webapi/entry.cgi`) and `proxy.cgi`/`oauth_callback.cgi` (calling `http://127.0.0.1:8765`) now explicitly bypass any ambient `HTTP_PROXY`/`HTTPS_PROXY` configured in DSM Control Panel → Network → Proxy.
+4. **DSM 7.3 nginx `error_page` interception:** Kept HTTP 200 for the friendly backend-starting HTML on `GET /`, and 403 explanatory HTML/JSON on missing desktop user or non-admin denial (fail closed, never renders dashboard).
+5. **DSM 7.3 `SYNO.SDS.Session` desktop context:** `GPhotosMigrator.js` reads `SYNO.SDS.Session.user || SYNO.SDS.Session.account || SYNO.SDS.Session.username` (also checking `window.parent.SYNO.SDS.Session` if nested) and passes `?dsm_user=<encoded>` on initial iframe load and Reload. `proxy.cgi` strips `dsm_user` before forwarding to backend.
+6. **DSM 7.3 `SYNO.API.Auth` & `SYNO.Foto.*`:** `photos_api.py` uses `SYNO.API.Auth` v6 (`format=sid`, `enable_syno_token=yes`), sends `_sid` in POST bodies with `X-SYNO-TOKEN`, and auto-relogins on code `119` — remains compatible with DSM 7.3.
+7. **SPK lifecycle & privileges:** `conf/privilege` (`run-as: package`, `gphotos-migrator`), `$SYNOPKG_PKGVAR/{config,work,inbox,sessions}` (`sessions/` created `chmod 700` in `start-stop-status`), `preupgrade` config snapshot, and `preuninst` backup to `${PHOTOS_DIR}/.gphotos-migrator-backup/` all verified compatible with DSM 7.3.
+8. **Static Package Center catalog bug (`0denko/gphotos-synology-repo`):** Static JSON feeds cannot hold two entries with the same `"package": "gphotos-migrator"` key — DSM indexes static feed arrays by `"package"` and the second entry (`arm64`) silently overwrites the first (`x86_64`). Dynamic package servers filter by the `?arch=` query param DSM sends. Therefore, `packages-x86_64.json` and `packages-arm64.json` are the proper per-arch defaults for static GitHub Pages hosting (and `index.html` / catalogs will be updated to match `1.2.0-0002`).
+
+#### 2. `1.2.0-0002` Changes Implemented
+- **`synology-spk/ui/dsm_auth.py` (new):** Shared Python 3.8+ helper for both CGIs:
+  - Validates browser `Cookie` header against `https://localhost:5001/webapi/entry.cgi` (loopback self-signed TLS comment documented), probing lightweight `SYNO.Core.NormalUser` (v1 `get`, returns server-verified `data.username` if available) → `SYNO.Core.Desktop.Timeout` (v1 `get`, ~100 B) → `SYNO.Core.Desktop.Initdata` (v1 `get`, verified live on DSM 7.3.2) ONLY on API-absent codes `(102, 103, 104)`, failing closed immediately on auth error codes (e.g. `119`).
+  - Validates username against `DSM_USER_RE` and checks `grp.getgrnam("administrators")` server-side.
+  - Mints server-side bridge session in `${PKG_VAR}/sessions/<sha256(token)>.json` (`0600`) bound to SHA-256 of DSM `id`/`_SSID` cookies + TTL (`1800s`), issuing `gphotos_dsm_bridge` (`HttpOnly; SameSite=Lax; Path=/webman/3rdparty/gphotos-migrator/; Secure`). Logout or DSM user switch invalidates the bridge immediately.
+- **`synology-spk/ui/proxy.cgi` & `synology-spk/ui/oauth_callback.cgi`:** Deduplicated onto `dsm_auth.py`; `oauth_callback.cgi` accepts valid bridge cookie OR performs fresh webapi validation (`X-DSM-Session-Verified: 1`) so the backend resolves the initiating user from server-side `oauth_state:<state>`.
+- **`src/gphotos_synology/web/security.py` & `routes.py`:** Scoped `X-DSM-Session-Verified: 1` (with valid `X-Proxy-Secret`) strictly to `GET /api/oauth/google/callback` when no bridge cookie is present, resolving `bound_dsm_user` + `is_admin` from server-side OAuth state while preserving C1/C2/G3 one-time-use & profile-access enforcement.
+- **Versions bumped coherently:** `pyproject.toml` (`1.2.0.2`, PEP 440 + `uv.lock` updated), `src/gphotos_synology/__init__.py` (`1.2.0-0002`), `synology-spk/build_spk.py` (`1.2.0-0002`), Git tag & Release `v1.2.0-0002`.
+- **Tests (`tests/test_dsm73_auth.py`):** Added full coverage for Python 3.8 AST compatibility, `_SSID` webapi validation, invalid/expired 403, missing desktop user fail-closed HTML, non-admin rejection, bridge cookie issuance/reuse/expiry/session-change invalidation, and `oauth_callback.cgi` via both bridge cookie and fresh webapi validation.
+
+— Antigravity
+

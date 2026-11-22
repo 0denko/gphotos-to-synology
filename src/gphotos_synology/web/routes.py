@@ -493,6 +493,7 @@ def create_api_router() -> APIRouter:
                 "profile_id": pctx.profile.id,
                 "redirect_uri": redirect_uri,
                 "dsm_user": identity.dsm_user,
+                "is_admin": identity.is_admin,
                 "created_at": time.time(),
             }
         )
@@ -546,13 +547,28 @@ def create_api_router() -> APIRouter:
 
         # C2 + G3: In proxied mode, verify callback user matches the user who started OAuth
         # BEFORE consuming state_key so another user cannot DoS a victim's in-flight OAuth state
-        if identity.via_proxy and bound_dsm_user and bound_dsm_user.lower() != identity.dsm_user.lower():
+        effective_identity = identity
+        if identity.via_proxy and not identity.dsm_user:
+            # Fresh DSM 7.3 webapi-validated callback without bridge cookie:
+            # take initiating user from server-side OAuth state (fail closed if absent).
+            if not bound_dsm_user or request.headers.get("x-dsm-session-verified", "").strip() != "1":
+                app_ctx.db.log_event("ERROR", "oauth", "Google OAuth callback rejected: missing initiating DSM user")
+                return RedirectResponse(url=f"{home_url}?oauth=error&detail=state_mismatch", status_code=302)
+            from gphotos_synology.web.security import RequestIdentity
+
+            effective_identity = RequestIdentity(
+                authenticated=True,
+                via_proxy=True,
+                dsm_user=bound_dsm_user,
+                is_admin=bool(rec.get("is_admin", False)),
+            )
+        elif identity.via_proxy and bound_dsm_user and bound_dsm_user.lower() != identity.dsm_user.lower():
             app_ctx.db.log_event("ERROR", "oauth", "Google OAuth callback rejected: DSM user mismatch")
             return RedirectResponse(url=f"{home_url}?oauth=error&detail=state_mismatch", status_code=302)
 
         try:
             pctx = app_ctx.registry.get_context(profile_id)
-            assert_profile_access(identity, pctx.profile)
+            assert_profile_access(effective_identity, pctx.profile)
         except (KeyError, HTTPException):
             return RedirectResponse(url=f"{home_url}?oauth=error&detail=profile_not_allowed", status_code=302)
 

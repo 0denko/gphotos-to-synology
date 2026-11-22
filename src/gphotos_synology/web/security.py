@@ -180,19 +180,36 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             provided_proxy_secret, proxy_secret
         ):
             dsm_user = request.headers.get("x-dsm-user", "").strip()
-            if not dsm_user or not DSM_USER_RE.match(dsm_user):
+            session_verified = request.headers.get("x-dsm-session-verified", "").strip() == "1"
+            if not dsm_user:
+                if path == "/api/oauth/google/callback" and method == "GET" and session_verified:
+                    # Top-level OAuth redirect after fresh DSM webapi validation (no bridge cookie):
+                    # google_oauth_callback resolves and verifies bound_dsm_user from server-side state.
+                    identity = RequestIdentity(
+                        authenticated=True,
+                        via_proxy=True,
+                        dsm_user="",
+                        is_admin=False,
+                    )
+                else:
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "Invalid or missing X-DSM-User from authenticated proxy"},
+                    )
+            elif not DSM_USER_RE.match(dsm_user):
                 return JSONResponse(
                     status_code=403,
                     content={"detail": "Invalid or missing X-DSM-User from authenticated proxy"},
                 )
-            dsm_admin_hdr = request.headers.get("x-dsm-admin", "").strip()
-            is_admin = (dsm_admin_hdr == "1") or (dsm_user.lower() in admin_users)
-            identity = RequestIdentity(
-                authenticated=True,
-                via_proxy=True,
-                dsm_user=dsm_user,
-                is_admin=is_admin,
-            )
+            else:
+                dsm_admin_hdr = request.headers.get("x-dsm-admin", "").strip()
+                is_admin = (dsm_admin_hdr == "1") or (dsm_user.lower() in admin_users)
+                identity = RequestIdentity(
+                    authenticated=True,
+                    via_proxy=True,
+                    dsm_user=dsm_user,
+                    is_admin=is_admin,
+                )
         elif api_token and provided_token and hmac.compare_digest(provided_token, api_token):
             identity = RequestIdentity(
                 authenticated=True,
