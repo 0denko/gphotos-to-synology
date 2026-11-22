@@ -122,6 +122,10 @@ jobs:
         run: |
           TAG="${{ github.ref_name }}"
           SPK="dist/gphotos-migrator-dsm7-${{ matrix.arch }}.spk"
+          # dist/ is written by the manylinux container running as root, so the
+          # runner user cannot create the .sha256 sidecar in it until ownership
+          # is reclaimed (run #12 failed at this step with "Permission denied").
+          sudo chown -R "$(id -u):$(id -g)" dist
           (cd dist && sha256sum "$(basename "$SPK")" > "$(basename "$SPK").sha256")
           ls -lh "$SPK" "${SPK}.sha256"
           if gh release view "$TAG" >/dev/null 2>&1; then
