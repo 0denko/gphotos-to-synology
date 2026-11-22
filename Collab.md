@@ -468,3 +468,24 @@ Ready for you to verify checksums, push the catalogs to `0denko/gphotos-synology
 
 — Antigravity
 
+
+### Bingo — 2026-11-22 — 0005 standalone fix does NOT cure real foreign sessions: root cause is the SynoToken
+
+Reproduced the owner's phone failure end-to-end on the NAS with a test session created from a temporary foreign LAN address (alias IP, removed after). Results against the installed 1.2.0-0005:
+
+- Probes from loopback for the foreign session: NormalUser 119, Desktop.Timeout 119, Initdata SUCCESS — but the payload is DEGRADED: `Session.user=None`, `Session.is_admin=False`, and the username string appears nowhere in the payload. `validate_dsm_session_via_webapi` returns `(True, None)`; the real CGI without a hint answers the styled 403 (missing_user); with the correct hint it answers 200. So 0005 behaves exactly like 0004 for genuinely foreign sessions.
+- Controlled variants of the Initdata probe: (A) loopback GET, cookies only -> degraded payload. (B) loopback GET + `SynoToken=<token from the login response>` -> FULL payload: `Session.user='odanylch'`, `is_admin=True`. (C) loopback POST form -> degraded. (D) GET from the session's own source address, no token -> degraded. The gate is the token, not the source, not the method.
+- Why the CGI cannot get the token standalone: DSM's own login bundle (`/usr/syno/synoman/webman/login/dist/dsm.login.bundle.js`) keeps the token in JS state — `setSynoToken()` stores it in `SYNO.SDS.Session.SynoToken` and hands it to `synowebapi.env`. It is not a cookie (an API login sets only `id` and `did`). The desktop app path works because GPhotosMigrator.js reads the desktop's JS state; a standalone page load has no parent JS state to read, and DSM offers no cookie-only identity lookup — the degraded Initdata (success, no identity, is_admin=false) appears to be DSM's deliberate posture for token-less calls. My Nov 21/22 `Session.user` evidence came from same-source test sessions and did not generalise; the 0005 regression tests modelled that same geometry, which is why they passed while the phone still fails.
+
+Implications / options (owner's call, do not silently weaken):
+1. If a request ever carries a SynoToken (the desktop JS could pass `SYNO.SDS.Session.SynoToken` alongside the username), the Initdata probe should send it — identity then resolves properly and the cross-check stays meaningful.
+2. Pure standalone (bookmark, no hint, no token) cannot be made both strict and working with DSM's public surface. The only cookie-only fallback is hint + valid-session proof + local admin-group check on the named user, which re-opens a bounded version of the pre-0005 hole: anyone holding ANY valid DSM session could name an admin and be treated as them (the degraded payload cannot even confirm the session's own admin status). On a single-admin household NAS the practical exposure is small, but it is a real privilege-escalation by design and needs the owner's explicit sign-off before shipping.
+3. Separate wrinkle in 0005: the new URL registration shows TWO "Google Photos Migrator" entries in the DSM main menu (desktop entry + URL entry), and the URL entry's icon reference is malformed — DSM's log shows the phone requesting a literal `/icon value` URL when rendering the menu. Cosmetic, but worth tidying (icon field in the .url registration).
+
+Owner is re-testing the main-menu (desktop) launch on the phone under 0005; if that path works on mobile, option 2 may not be needed at all.
+
+### Bingo — 2026-11-22 — Feature request: show scan rate, ETA and CPU load in the Live Background Worker card
+
+Owner, watching the new parallel indexer on the phone: the worker card shows only raw counts (12975/177238) — "There's no eta or cpu load here." Fair point, and slightly ironic: 0005's headline behaviour is polite CPU discipline, but the UI surfaces none of it, so the politeness is unverifiable from the dashboard.
+
+Requested status additions for the indexing phase: (1) rolling scan rate (items/min over the last few minutes, not a lifetime average — the rate differs sharply between already-indexed skips and fresh fingerprinting); (2) ETA for the current phase computed from that rolling rate and the remaining count; (3) worker CPU load (backend process CPU% is fine) plus the active indexer worker count and a visible indicator when the load-aware throttle has shed workers. All three are cheap: the scanner already tracks progress, and CPU is one /proc read. Same treatment would suit the archive-processing phase when it starts.
