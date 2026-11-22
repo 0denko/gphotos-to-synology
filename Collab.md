@@ -410,19 +410,15 @@ Quick field update on the two mobile items:
 
 — Bingo
 
-### 2026-11-22 — Bingo — Feature request: parallelize the existing-library indexer (single-threaded today, ~1.2 s/photo)
+### 2026-11-22 — Bingo — Constraint on the parallel-indexing request: capped and polite, never CPU-maxing
 
-**Field data:** the user's first full index (177,238 items in his Photos folder) is running at ~3,100 items/hour (~1.2 s/item, measured between dashboard readings). On his DS3622xs+ that projects to roughly two days for the initial pass. The user asked whether multiple threads are possible; the answer is yes, and the workload is well suited to it. He has chosen to let the current run finish as-is, so this is a next-release item, not a hotfix.
+Amendment from the user to the parallel-indexing feature request in the previous entry: **the NAS has other jobs and must stay responsive — the indexer must not max the CPU.** Treat this as a hard requirement, not a tuning nicety:
 
-**Where the time goes (v1.2.0-0004 code):** `ExistingLibraryScanner.scan()` is one sequential loop. Per new image, `compute_media_fingerprint()` does a full-file SHA-256 read, a full-resolution PIL decode + RGB conversion, a SHA-256 over the raw pixel buffer, the composite dHash, sharpness, and then a per-file SQLite upsert. All independent per file — nothing in the fingerprint stage depends on neighbouring files.
+- Default the worker pool small (2 workers) with a conservative hard cap, configurable in Settings.
+- Run the indexing work at reduced process priority (e.g. `nice` the worker threads/processes) so interactive DSM services always win contention.
+- Design target: keep clear headroom at all times (the indexer should behave like a background citizen — closer to the current single-core footprint plus a modest increment, not a race to saturate every core). If a load-aware throttle is feasible (pause or shed a worker when system load is high), prefer it; a fixed small pool plus low priority is the acceptable minimum.
+- The benchmark in the original request should report the CPU ceiling alongside items/sec, so the speed/politeness trade-off is explicit.
 
-**Suggested design:**
-1. Split compute from commit: a bounded executor computes `MediaFingerprint`s; the main thread keeps the single-writer SQLite upserts, the incremental skip checks (size + mtime + visual-stable, applied *before* dispatch so unchanged files still cost ~nothing), and monotonic progress reporting.
-2. Prefer `ProcessPoolExecutor` for true parallelism. If spawning from the PyInstaller-frozen binary proves fragile, a `ThreadPoolExecutor` still gains substantially here: Pillow's codecs and hashlib both release the GIL for the expensive parts. Measure both on a ~5k-file sample and keep the better one.
-3. Bound the in-flight window (backpressure) so decoded full-res images can't accumulate in memory; a worker's pixel buffer is freed as soon as its hashes are computed.
-4. Make the worker count a setting with a conservative default (e.g. `min(4, cpu_count)`); on spinning disks the useful ceiling arrives earlier than on SSD, so don't hard-code an aggressive number.
-5. Keep the behaviour otherwise identical: same fingerprint fields, same dedup semantics, resumable mid-index (the skip logic already makes an interrupted scan cheap to redo — an upgrade mid-index loses no work).
-
-**Expected gain:** roughly 2–4× on a multi-core NAS with the thread pool, more predictable with processes — the two-day initial index becomes an overnight one, which also unblocks the Takeout processing that queues behind the same worker.
+For the record, the current single-threaded run already satisfies the user's constraint (one core, box stays responsive) — that's part of why he chose to let it finish as-is rather than switch to strict-hash mode.
 
 — Bingo
