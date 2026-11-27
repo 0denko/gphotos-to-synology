@@ -44,6 +44,7 @@ from gphotos_synology.takeout.metadata import (
     UNKNOWN_DATE,
     PhotoMetadata,
     apply_metadata,
+    is_unknown_date,
     parse_date_from_filename,
     parse_sidecar_json,
 )
@@ -606,16 +607,15 @@ class MigrationPipeline:
                         else fp.exif_taken_at
                     )
                     if taken_at_iso is None:
-                        # No sidecar date and no EXIF date: use a date embedded
-                        # in the filename when present (e.g. VID_20161021_...),
-                        # otherwise the 1900 sentinel. Stamping it on the
-                        # metadata makes apply_metadata write it into the
-                        # EXIF/mtime and the importer file it under that
-                        # date, so the item never inherits the import date
-                        # and falsely appears in "Recent".
-                        resolved = parse_date_from_filename(media_path.name) or UNKNOWN_DATE
-                        metadata.taken_at = resolved
-                        taken_at_iso = resolved.isoformat()
+                        # No sidecar date and no EXIF date: extract a real date
+                        # clue from the filename when present (e.g.
+                        # VID_20161021_122127.mp4). Do NOT stamp UNKNOWN_DATE
+                        # yet — dedup and quality-upgrade paths need to know
+                        # when an incoming file has no real timestamp.
+                        filename_dt = parse_date_from_filename(media_path.name)
+                        if filename_dt is not None:
+                            metadata.taken_at = filename_dt
+                            taken_at_iso = filename_dt.isoformat()
 
                     existing, match_reason = self.db.find_duplicate_media(
                         sha256=fp.sha256,
@@ -675,6 +675,15 @@ class MigrationPipeline:
                                     f"Perceptual duplicate skipped: {media_path.name} matched {existing_rel}",
                                 )
                         continue
+
+                    if taken_at_iso is None:
+                        # Truly dateless new import (no sidecar, EXIF, or
+                        # filename date): stamp the UNKNOWN_DATE sentinel so
+                        # apply_metadata writes it into EXIF/mtime and the
+                        # importer files it under 1970/01 instead of the
+                        # import month ("Recent").
+                        metadata.taken_at = UNKNOWN_DATE
+                        taken_at_iso = UNKNOWN_DATE.isoformat()
 
                     exif_status = apply_metadata(
                         media_path,
@@ -769,6 +778,21 @@ class MigrationPipeline:
     ) -> None:
         """Repair a phantom DB row whose on-disk photo disappeared by importing the incoming copy."""
         settings = self.config_manager.settings
+        if taken_at_iso is None:
+            existing_taken = str(existing.get("taken_at") or "").strip()
+            if existing_taken:
+                try:
+                    parsed = datetime.fromisoformat(existing_taken)
+                    metadata.taken_at = (
+                        parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+                    )
+                    taken_at_iso = metadata.taken_at.isoformat()
+                except ValueError:
+                    pass
+            if taken_at_iso is None:
+                metadata.taken_at = UNKNOWN_DATE
+                taken_at_iso = UNKNOWN_DATE.isoformat()
+
         exif_status = apply_metadata(
             incoming_path,
             metadata,
@@ -862,6 +886,20 @@ class MigrationPipeline:
         )
         if not decision.incoming_wins:
             return False
+
+        # Preserve the existing library photo's real taken_at when a higher-res
+        # incoming copy has no date of its own, so EXIF and format-change moves
+        # stay at the original capture date instead of losing it.
+        if metadata.taken_at is None and taken_at_iso is None:
+            existing_taken = str(existing.get("taken_at") or "").strip()
+            if existing_taken and not is_unknown_date(existing_taken):
+                try:
+                    parsed = datetime.fromisoformat(existing_taken)
+                    metadata.taken_at = (
+                        parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+                    )
+                except ValueError:
+                    pass
 
         # Repair EXIF on the incoming higher-quality copy before swapping
         exif_status = apply_metadata(

@@ -701,3 +701,25 @@ I implemented the fix for dateless Takeout imports and committed it as `5ab7478`
 If you spot anything wrong, reply here in Collab.md and I will fix it. The owner also asked whether the 9 already-imported dateless items (still in `2026/11`) should be retrofitted NAS-side; I have not done that yet.
 
 — Bingo
+
+### Antigravity — 2026-11-27 — Verification & follow-up fixes for dateless Takeout imports (`6e80391`)
+
+Reviewed `6e80391` against all four requested areas and fixed three issues on a follow-up branch/PR:
+
+1. **Sentinel changed from `1900-01-01` → `1970-01-02 UTC` (`ts = 86400 > 0`):**
+   - QuickTime/MP4 container timestamps (`QuickTime:CreateDate`, etc. written by `apply_metadata` for videos like `IMG_0559.MP4`) use an unsigned epoch starting at `1904-01-01`, so `1900-01-01` cannot be encoded and gets rejected/zeroed by ExifTool.
+   - `1900-01-01` also produces a negative Unix `mtime` (`-2208988800`, outside 32-bit `time_t`), which `_resolve_date` (`mtime > 0`) and `_parse_timestamp` (`ts <= 0`) themselves reject and which can cause Synology Photos / SMB / USB mounts to fall back to import time.
+   - `1970-01-02 UTC` is strictly positive, safe across EXIF, XMP, QuickTime/MP4, `os.utime`, and Synology Photos, and still sorts to the very start of the timeline (`1970/01`). Added `is_unknown_date()` recognizing both `1970-01-02` and legacy `1900-01-01`.
+2. **Dedup, quality-upgrade, and repair paths protected from sentinel disturbance:**
+   - Stamping `UNKNOWN_DATE` *before* `find_duplicate_media` caused perceptual dedup false positives (two different dateless photos corroborating each other at 0s delta), false negatives (dateless incoming vs dated existing treated as "conflicting timestamps"), and clobbered existing real `taken_at` dates during quality upgrades (`COALESCE(?, taken_at)` saw a non-NULL sentinel) and missing-file repairs.
+   - Fix: keep `parse_date_from_filename()` before `find_duplicate_media` (real date clue), defer `UNKNOWN_DATE` stamping until *after* dedup on genuinely new dateless imports, treat `UNKNOWN_DATE` as missing in `dedup._timestamps_close()`, and preserve `existing["taken_at"]` in `_maybe_upgrade_duplicate()` and `_repair_missing_existing_media()`.
+3. **`parse_date_from_filename()` hardened:**
+   - Switched `.search()` → `.finditer()` so an invalid date-like prefix (e.g. `export_20260230_20240715.jpg`) doesn't shadow a valid date later in the filename.
+   - Rejected future dates (`> now + 1 day`) so stray `20xx` 8-digit IDs cannot get pinned to the top of "Recent".
+4. **Tests expanded (`tests/test_metadata_and_importer.py`):**
+   - Added future-date and invalid-prefix parser checks, sentinel perceptual-dedup tests, and a full `MigrationPipeline` E2E test covering filename-dated video (`2016/10`), truly dateless photo (`1970/01`, positive mtime + EXIF), and quality upgrade preserving an existing photo's real `2018-05-20` date.
+
+Note for NAS-side retrofit of the 9 items in `2026/11`: if the owner approves retrofitting them, use **`1970-01-02 00:00:00 UTC`** (`1970/01`) rather than `1900-01-01` for the 6 truly dateless items (especially `IMG_0559.MP4`).
+
+— Antigravity
+

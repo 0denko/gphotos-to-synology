@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover - optional if libheif unavailable
 
 from gphotos_synology.takeout.extractor import compute_file_sha256
 from gphotos_synology.takeout.matcher import is_video_file
+from gphotos_synology.takeout.metadata import is_unknown_date
 
 logger = logging.getLogger(__name__)
 
@@ -362,6 +363,8 @@ def _parse_iso_utc(iso_str: str | None) -> datetime | None:
 
 
 def _timestamps_close(iso_a: str | None, iso_b: str | None, max_delta_seconds: int = 15) -> bool | None:
+    if is_unknown_date(iso_a) or is_unknown_date(iso_b):
+        return None
     dt_a = _parse_iso_utc(iso_a)
     dt_b = _parse_iso_utc(iso_b)
     if dt_a is None or dt_b is None:

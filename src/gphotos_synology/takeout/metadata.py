@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from gphotos_synology.takeout.matcher import is_video_file
@@ -17,11 +17,37 @@ from gphotos_synology.takeout.matcher import is_video_file
 logger = logging.getLogger(__name__)
 
 # Sentinel date for media with no determinable taken date (no sidecar date,
-# no EXIF date, no date in the filename). 1900-01-01 sorts to the very start
-# of the timeline so such items never falsely appear in "Recent" / the
-# current month, which is what happens when the date is left blank and
-# Synology Photos falls back to the import date.
-UNKNOWN_DATE = datetime(1900, 1, 1, tzinfo=UTC)
+# no EXIF date, no date in the filename). 1970-01-02 UTC (Unix ts = 86400)
+# sorts to the start of any digital photo timeline while staying strictly
+# positive for Unix mtime / Synology Photos and well after the 1904-01-01
+# QuickTime/MP4 container epoch (unlike 1900-01-01, which ExifTool cannot
+# write into MP4 QuickTime tags and which produces negative mtimes).
+UNKNOWN_DATE = datetime(1970, 1, 2, tzinfo=UTC)
+_UNKNOWN_DATE_ISO = UNKNOWN_DATE.isoformat()
+_LEGACY_UNKNOWN_DATE_ISO = datetime(1900, 1, 1, tzinfo=UTC).isoformat()
+
+
+def is_unknown_date(value: datetime | str | None) -> bool:
+    """Return True if `value` equals the synthetic UNKNOWN_DATE sentinel."""
+    if value is None:
+        return False
+    if isinstance(value, datetime):
+        dt = value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return dt == UNKNOWN_DATE or dt == datetime(1900, 1, 1, tzinfo=UTC)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return False
+        if cleaned in (_UNKNOWN_DATE_ISO, _LEGACY_UNKNOWN_DATE_ISO):
+            return True
+        try:
+            dt = datetime.fromisoformat(cleaned)
+        except ValueError:
+            return False
+        dt_utc = dt.astimezone(UTC) if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+        return dt_utc == UNKNOWN_DATE or dt_utc == datetime(1900, 1, 1, tzinfo=UTC)
+    return False
+
 
 # Filename date clues: YYYYMMDD (optionally followed by _HHMMSS) and
 # YYYY-MM-DD / YYYY_MM_DD / YYYY.MM.DD (optionally followed by a time).
@@ -42,36 +68,39 @@ _FILENAME_TIME_RE = re.compile(
 def parse_date_from_filename(filename: str) -> datetime | None:
     """Extract a taken date from a filename, e.g. VID_20161021_122127.mp4.
 
-    Returns None when the filename carries no valid YYYYMMDD (or
+    Returns None when the filename carries no valid, non-future YYYYMMDD (or
     YYYY-MM-DD) date. The time is taken from a trailing _HHMMSS group when
     present and valid, otherwise midnight UTC.
     """
-    match = _FILENAME_DATE_RE.search(filename)
-    if match is None:
-        return None
-    year = int(match.group("year"))
-    month = int(match.group("month"))
-    day = int(match.group("day"))
-    hour = minute = second = 0
-    rest = filename[match.end():]
-    time_match = _FILENAME_TIME_RE.match(rest)
-    if time_match is not None:
-        hour = int(time_match.group("hour"))
-        minute = int(time_match.group("minute"))
-        second = int(time_match.group("second"))
-    try:
-        return datetime(year, month, day, hour, minute, second, tzinfo=UTC)
-    except ValueError:
-        return None
+    max_allowed = datetime.now(UTC) + timedelta(days=1)
+    for match in _FILENAME_DATE_RE.finditer(filename):
+        year = int(match.group("year"))
+        month = int(match.group("month"))
+        day = int(match.group("day"))
+        hour = minute = second = 0
+        rest = filename[match.end():]
+        time_match = _FILENAME_TIME_RE.match(rest)
+        if time_match is not None:
+            hour = int(time_match.group("hour"))
+            minute = int(time_match.group("minute"))
+            second = int(time_match.group("second"))
+        try:
+            candidate = datetime(year, month, day, hour, minute, second, tzinfo=UTC)
+        except ValueError:
+            continue
+        if candidate > max_allowed:
+            continue
+        return candidate
+    return None
 
 
 # Taken-date priority for an import:
 #   1. Takeout sidecar date (photoTakenTime / creationTime).
 #   2. The file's own EXIF DateTimeOriginal.
 #   3. A date embedded in the filename (parse_date_from_filename).
-#   4. UNKNOWN_DATE (1900-01-01) when nothing else is available, so the item
-#      sorts to the start of the timeline instead of inheriting the import
-#      date and falsely appearing in "Recent".
+#   4. UNKNOWN_DATE (1970-01-02) when nothing else is available, applied only
+#      at final import/repair time so it never disturbs dedup or overwrites a
+#      real date during quality upgrades.
 
 
 @dataclass
