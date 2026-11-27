@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -14,6 +15,63 @@ from pathlib import Path
 from gphotos_synology.takeout.matcher import is_video_file
 
 logger = logging.getLogger(__name__)
+
+# Sentinel date for media with no determinable taken date (no sidecar date,
+# no EXIF date, no date in the filename). 1900-01-01 sorts to the very start
+# of the timeline so such items never falsely appear in "Recent" / the
+# current month, which is what happens when the date is left blank and
+# Synology Photos falls back to the import date.
+UNKNOWN_DATE = datetime(1900, 1, 1, tzinfo=UTC)
+
+# Filename date clues: YYYYMMDD (optionally followed by _HHMMSS) and
+# YYYY-MM-DD / YYYY_MM_DD / YYYY.MM.DD (optionally followed by a time).
+_FILENAME_DATE_RE = re.compile(
+    r"(?<!\d)"
+    r"(?P<year>19\d{2}|20\d{2})"
+    r"(?P<sep>[-_.]?)"
+    r"(?P<month>0[1-9]|1[0-2])"
+    r"(?P=sep)"
+    r"(?P<day>0[1-9]|[12]\d|3[01])"
+    r"(?!\d)"
+)
+_FILENAME_TIME_RE = re.compile(
+    r"^[_-]?(?P<hour>[01]\d|2[0-3])(?P<minute>[0-5]\d)(?P<second>[0-5]\d)(?!\d)"
+)
+
+
+def parse_date_from_filename(filename: str) -> datetime | None:
+    """Extract a taken date from a filename, e.g. VID_20161021_122127.mp4.
+
+    Returns None when the filename carries no valid YYYYMMDD (or
+    YYYY-MM-DD) date. The time is taken from a trailing _HHMMSS group when
+    present and valid, otherwise midnight UTC.
+    """
+    match = _FILENAME_DATE_RE.search(filename)
+    if match is None:
+        return None
+    year = int(match.group("year"))
+    month = int(match.group("month"))
+    day = int(match.group("day"))
+    hour = minute = second = 0
+    rest = filename[match.end():]
+    time_match = _FILENAME_TIME_RE.match(rest)
+    if time_match is not None:
+        hour = int(time_match.group("hour"))
+        minute = int(time_match.group("minute"))
+        second = int(time_match.group("second"))
+    try:
+        return datetime(year, month, day, hour, minute, second, tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+# Taken-date priority for an import:
+#   1. Takeout sidecar date (photoTakenTime / creationTime).
+#   2. The file's own EXIF DateTimeOriginal.
+#   3. A date embedded in the filename (parse_date_from_filename).
+#   4. UNKNOWN_DATE (1900-01-01) when nothing else is available, so the item
+#      sorts to the start of the timeline instead of inheriting the import
+#      date and falsely appearing in "Recent".
 
 
 @dataclass

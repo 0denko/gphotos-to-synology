@@ -40,7 +40,13 @@ from gphotos_synology.takeout.matcher import (
     find_sidecar_json,
     is_media_file,
 )
-from gphotos_synology.takeout.metadata import PhotoMetadata, apply_metadata, parse_sidecar_json
+from gphotos_synology.takeout.metadata import (
+    UNKNOWN_DATE,
+    PhotoMetadata,
+    apply_metadata,
+    parse_date_from_filename,
+    parse_sidecar_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -599,6 +605,17 @@ class MigrationPipeline:
                         if metadata.taken_at is not None
                         else fp.exif_taken_at
                     )
+                    if taken_at_iso is None:
+                        # No sidecar date and no EXIF date: use a date embedded
+                        # in the filename when present (e.g. VID_20161021_...),
+                        # otherwise the 1900 sentinel. Stamping it on the
+                        # metadata makes apply_metadata write it into the
+                        # EXIF/mtime and the importer file it under that
+                        # date, so the item never inherits the import date
+                        # and falsely appears in "Recent".
+                        resolved = parse_date_from_filename(media_path.name) or UNKNOWN_DATE
+                        metadata.taken_at = resolved
+                        taken_at_iso = resolved.isoformat()
 
                     existing, match_reason = self.db.find_duplicate_media(
                         sha256=fp.sha256,
